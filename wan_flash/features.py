@@ -33,11 +33,32 @@ class FwdFeatures:
     scheduler: str = "persistent"        # +1.5% self@32760, +15% cross
 
 
+@dataclass(frozen=True)
+class BwdFeatures:
+    """Backward flags (docs/FEATURES.md for measured verdicts).
+
+    tile_m      Q-tile of the dK/dV-stationary main kernel. 80 = FA4/FA3
+                non-causal hd128 config (dQ_swapAB derived as tile_m%64!=0);
+                64 = the causal-config alternative (no dQ_swapAB).
+    tile_n      KV tile; fixed 128 (= 64 * 2 MMA warpgroups under SdP_swapAB).
+    num_stages  Q/dO/dS smem pipeline depth (2 = FA4 default).
+    """
+
+    tile_m: int = 80
+    tile_n: int = 128
+    num_stages: int = 2
+
+
 _current = FwdFeatures()
+_current_bwd = BwdFeatures()
 
 
 def get() -> FwdFeatures:
     return _current
+
+
+def get_bwd() -> BwdFeatures:
+    return _current_bwd
 
 
 def set_overrides(**kw):
@@ -46,6 +67,13 @@ def set_overrides(**kw):
     return _current
 
 
+def set_bwd_overrides(**kw):
+    global _current_bwd
+    _current_bwd = replace(_current_bwd, **kw)
+    return _current_bwd
+
+
 def reset():
-    global _current
+    global _current, _current_bwd
     _current = FwdFeatures()
+    _current_bwd = BwdFeatures()
