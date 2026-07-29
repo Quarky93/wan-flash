@@ -810,11 +810,8 @@ class WanFlashBwdSm90:
             barrier_id=BAR_PDS, num_threads=self.num_mma_threads
         )
 
-        # K-direction ragged tail: mask columns >= seqlen_k - n_block*tile_n.
-        # Only the last n_block CTA has a tail (uniform runtime skip; compiled
-        # out entirely when seqlen_k divides tile_n).
+        # K-direction ragged tail: mask columns >= seqlen_k - n_block*tile_n
         seqlenk_col_start = seqlen_k - n_block * self.tile_n
-        need_k_mask = Boolean(seqlenk_col_start < self.tile_n)
 
         if const_expr(self.nsplit > 1):
             # a split's range can be empty; its accumulators must still be
@@ -832,7 +829,7 @@ class WanFlashBwdSm90:
                 mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
                 copy_dS_r2s, pipeline_q, pipeline_do,
                 tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
-                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, need_k_mask,
+                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
                 PdS_barrier, dKV_accumulate,
             )
             dKV_accumulate = Boolean(True)
@@ -861,7 +858,7 @@ class WanFlashBwdSm90:
         mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
         copy_dS_r2s, pipeline_q, pipeline_do,
         tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
-        thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, need_k_mask: Boolean,
+        thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
         PdS_barrier, dKV_accumulate: Boolean,
     ):
         smem_idx = c_state.index
@@ -875,24 +872,25 @@ class WanFlashBwdSm90:
         pipeline_do.consumer_wait(c_state, pipeline_do.consumer_try_wait(c_state))
         acc_dP = mma_dov_fn(A_idx=smem_idx, wg_wait=1)  # waits GEMM 1
 
-        # K-tail mask (m-tail is masked for free by the +inf LSE sentinel
-        # written in preprocess). Only the last n_block CTA runs the selects;
-        # compiled out entirely when seqlen_k % tile_n == 0.
+        # K-tail mask: predicated selects, every iteration (FA4 behavior; a
+        # runtime skip-branch for non-tail CTAs was measured SLOWER -- the
+        # scf.if region inhibits scheduling around it). m-tail is masked for
+        # free by the +inf LSE sentinel written in preprocess. Compiled out
+        # when seqlen_k % tile_n == 0.
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
         if const_expr(self.seqlen_k_static % self.tile_n != 0):
-            if need_k_mask:
-                cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
-                tScS_mn = layout_utils.reshape_acc_to_mn(
-                    thr_mma_SdP.partition_C(cS), transpose=True
-                )
-                t0ScS_mn = layout_utils.reshape_acc_to_mn(
-                    tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
-                )
-                limit = seqlenk_col_start - tScS_mn[0][0]
-                for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                    oob = t0ScS_mn[0, c][0] >= limit
-                    for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
-                        acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+            cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+            tScS_mn = layout_utils.reshape_acc_to_mn(
+                thr_mma_SdP.partition_C(cS), transpose=True
+            )
+            t0ScS_mn = layout_utils.reshape_acc_to_mn(
+                tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
+            )
+            limit = seqlenk_col_start - tScS_mn[0][0]
+            for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                oob = t0ScS_mn[0, c][0] >= limit
+                for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+                    acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
 
         # [Pointwise 1] P = exp2(S*scale_log2 - lse_log2)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
