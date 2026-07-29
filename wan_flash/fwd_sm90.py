@@ -619,7 +619,7 @@ class WanFlashFwdSm90:
                     m_block = rest % m_blocks
                 else:
                     m_block, head, batch = cute.arch.block_idx()
-                self._consumer_tile(
+                q_state, kv_state = self._consumer_tile(
                     mO, mLSE, sO, sQ, tiled_mma_qk, tiled_mma_pv, thr_mma_qk,
                     thr_mma_pv, mma_qk_fn, mma_pv_fn, acc_O, tOrP,
                     row_max, row_sum, row_scale, num_rows,
@@ -785,3 +785,4 @@ class WanFlashFwdSm90:
                         barrier_id=BAR_O_FREE,
                         number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
                     )
+            return q_state, kv_state
