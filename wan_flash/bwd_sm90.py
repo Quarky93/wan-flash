@@ -239,15 +239,18 @@ class WanFlashBwdSm90:
         tile_m: int = 80,
         tile_n: int = 128,
         num_stages: int = 2,
+        nsplit: int = 1,
     ):
         self.num_wg_mma = 2
         assert head_dim % 16 == 0 and head_dim <= 128
         assert tile_n == 64 * self.num_wg_mma, "SdP_swapAB M = tile_n = 64*num_wg"
         assert tile_m % 16 == 0, "dK/dV contraction (K = tile_m) tiles by k16"
         assert num_stages in (1, 2)
+        assert nsplit >= 1
         self.head_dim = head_dim
         self.tile_m = tile_m
         self.tile_n = tile_n
+        self.nsplit = nsplit  # >1: split the m loop; dK/dV via fp32 gmem accum
         self.Q_stage = num_stages
         self.dO_stage = num_stages
         self.PdS_stage = num_stages
@@ -346,7 +349,6 @@ class WanFlashBwdSm90:
         class SharedStorage:
             mbar_Q: cute.struct.MemRange[cutlass.Int64, self.Q_stage * 2]
             mbar_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
-            mbar_KV: cute.struct.MemRange[cutlass.Int64, 1 * 2]
             sLSE: cute.struct.Align[
                 cute.struct.MemRange[Float32, stat_elems * self.Q_stage], 128
             ]
@@ -373,17 +375,25 @@ class WanFlashBwdSm90:
         mLSElog2: cute.Tensor,  # (b, h, s_q_rounded) fp32 (lse * log2e, +inf pad)
         mdPsum: cute.Tensor,    # (b, h, s_q_rounded) fp32
         mdQaccum: cute.Tensor,  # (b, h, s_q_rounded * d) fp32, pre-zeroed
-        mdK: cute.Tensor,       # (b, s_kv, h, d) bf16 out
-        mdV: cute.Tensor,       # (b, s_kv, h, d) bf16 out
+        mdK: cute.Tensor,       # nsplit=1: (b, s_kv, h, d) bf16 out
+                                # nsplit>1: (b, h, s_kv_rounded * d) fp32 accum
+        mdV: cute.Tensor,       # same
         stream: cuda.CUstream,
     ):
         # (b, s, h, d) -> (s, d, h, b); (b, h, X) -> (X, h, b)
-        mQ, mK, mV, mdO, mdK, mdV = [
-            layout_utils.select(t, [1, 3, 2, 0]) for t in (mQ, mK, mV, mdO, mdK, mdV)
+        mQ, mK, mV, mdO = [
+            layout_utils.select(t, [1, 3, 2, 0]) for t in (mQ, mK, mV, mdO)
         ]
+        if const_expr(self.nsplit == 1):
+            mdK, mdV = [layout_utils.select(t, [1, 3, 2, 0]) for t in (mdK, mdV)]
+        else:
+            mdK, mdV = [layout_utils.select(t, [2, 1, 0]) for t in (mdK, mdV)]
         mLSElog2, mdPsum, mdQaccum = [
             layout_utils.select(t, [2, 1, 0]) for t in (mLSElog2, mdPsum, mdQaccum)
         ]
+
+        # static shapes: baked per compile (K-tail mask codegen depends on it)
+        self.seqlen_k_static = cute.size(mK.shape[0])
 
         sQ_l, sdO_l, sK_l, sV_l, sdS_l, sdQaccum_l = self._make_layouts()
         tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ = self._make_tiled_mmas()
@@ -409,12 +419,16 @@ class WanFlashBwdSm90:
         tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
             op_g2s, mV, cute.select(sV_l, mode=[0, 1]), (self.tile_n, self.head_dim)
         )
-        tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
-            op_s2g, mdK, cute.select(sK_l, mode=[0, 1]), (self.tile_n, self.head_dim)
-        )
-        tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
-            op_s2g, mdV, cute.select(sV_l, mode=[0, 1]), (self.tile_n, self.head_dim)
-        )
+        if const_expr(self.nsplit == 1):
+            tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
+                op_s2g, mdK, cute.select(sK_l, mode=[0, 1]), (self.tile_n, self.head_dim)
+            )
+            tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
+                op_s2g, mdV, cute.select(sV_l, mode=[0, 1]), (self.tile_n, self.head_dim)
+            )
+        else:
+            tma_atom_dK = tma_atom_dV = None
+            tma_tensor_dK, tma_tensor_dV = mdK, mdV
 
         # dQaccum r2s: flat 128-bit chunks, thread t of WG w -> (t, w) slot
         r2s_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
@@ -422,18 +436,24 @@ class WanFlashBwdSm90:
             cute.make_layout((128, self.num_wg_dQ)),
             cute.make_layout(128 // Float32.width),
         )
+        # dK/dV accum r2s (nsplit>1): per-WG flat chunk, thread-local 4-elem slots
+        r2s_tiled_copy_dKVaccum = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+            cute.make_layout(128),
+            cute.make_layout(128 // Float32.width),
+        )
 
         SharedStorage = self._make_storage(sQ_l, sdO_l, sK_l, sV_l, sdS_l, sdQaccum_l)
 
         n_blocks = cute.ceil_div(cute.size(mK.shape[0]), self.tile_n)
-        grid = (n_blocks, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
+        grid = (n_blocks * self.nsplit, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
         self.kernel(
             tma_tensor_Q, tma_tensor_K, tma_tensor_V, tma_tensor_dO,
             tma_tensor_dK, tma_tensor_dV,
             mLSElog2, mdPsum, mdQaccum,
             tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV,
             sQ_l, sdO_l, sK_l, sV_l, sdS_l, sdQaccum_l,
-            r2s_tiled_copy_dQaccum,
+            r2s_tiled_copy_dQaccum, r2s_tiled_copy_dKVaccum,
             tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
             tma_bytes["Q"], tma_bytes["K"], tma_bytes["V"], tma_bytes["dO"],
             tma_bytes_stat, tma_bytes_dQ,
@@ -472,6 +492,7 @@ class WanFlashBwdSm90:
         sdS_layout: cute.ComposedLayout,
         sdQaccum_layout: cute.Layout,
         r2s_tiled_copy_dQaccum: cute.TiledCopy,
+        r2s_tiled_copy_dKVaccum: cute.TiledCopy,
         tiled_mma_SdP: cute.TiledMma,
         tiled_mma_dKV: cute.TiledMma,
         tiled_mma_dQ: cute.TiledMma,
@@ -487,7 +508,8 @@ class WanFlashBwdSm90:
         if warp_idx == 0:
             for atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO,
                          tma_atom_dK, tma_atom_dV):
-                cpasync.prefetch_descriptor(atom)
+                if const_expr(atom is not None):
+                    cpasync.prefetch_descriptor(atom)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -511,14 +533,6 @@ class WanFlashBwdSm90:
             tx_count=tma_bytes_dO + tma_bytes_stat,
             defer_sync=True,
         )
-        pipeline_kv = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_KV.data_ptr(),
-            num_stages=1,
-            producer_group=tma_warp,
-            consumer_group=mma_warps,
-            tx_count=tma_bytes_K + tma_bytes_V,
-            defer_sync=True,
-        )
         pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -536,8 +550,18 @@ class WanFlashBwdSm90:
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         seqlen_q = cute.size(mQ.shape[0])
+        seqlen_k = cute.size(mK.shape[0])
         m_blocks = cute.ceil_div(seqlen_q, self.tile_m)
-        n_block, head, batch = cute.arch.block_idx()
+        bx, head, batch = cute.arch.block_idx()
+        if const_expr(self.nsplit == 1):
+            n_block = bx
+            m_lo, m_hi = 0, m_blocks
+        else:
+            n_block = bx // self.nsplit
+            split = bx % self.nsplit
+            chunk_m = cute.ceil_div(m_blocks, self.nsplit)
+            m_lo = split * chunk_m
+            m_hi = cutlass.min(Int32(m_blocks), m_lo + chunk_m)
 
         pipeline_init_wait(cluster_shape_mn=(1, 1))
 
@@ -548,21 +572,24 @@ class WanFlashBwdSm90:
                     mQ, mK, mV, mdO, mLSElog2, mdPsum,
                     sQ, sK, sV, sdO, sLSE, sdPsum,
                     tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO,
-                    pipeline_q, pipeline_do, pipeline_kv,
-                    n_block, head, batch, m_blocks,
+                    pipeline_q, pipeline_do,
+                    n_block, head, batch, m_lo, m_hi,
+                    tma_bytes_K, tma_bytes_V,
                 )
             if warp_idx == 1:
-                self._dq_store(mdQaccum, sdQaccum, head, batch, m_blocks, tma_bytes_dQ)
+                self._dq_store(mdQaccum, sdQaccum, head, batch, m_lo, m_hi,
+                               tma_bytes_dQ)
         else:
             cute.arch.setmaxregister_increase(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
             self._mma(
                 mdK, mdV, sQ, sK, sV, sdO, sdS, sLSE, sdPsum, sdQaccum,
-                tma_atom_dK, tma_atom_dV, r2s_tiled_copy_dQaccum,
+                tma_atom_dK, tma_atom_dV,
+                r2s_tiled_copy_dQaccum, r2s_tiled_copy_dKVaccum,
                 tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
-                pipeline_q, pipeline_do, pipeline_kv,
-                tidx, n_block, head, batch, m_blocks,
+                pipeline_q, pipeline_do,
+                tidx, n_block, head, batch, m_lo, m_hi, seqlen_k,
             )
 
     # ---------------------------------------------------- producer (warp 0)
@@ -571,8 +598,9 @@ class WanFlashBwdSm90:
         self, mQ, mK, mV, mdO, mLSElog2, mdPsum,
         sQ, sK, sV, sdO, sLSE, sdPsum,
         tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO,
-        pipeline_q, pipeline_do, pipeline_kv,
-        n_block, head, batch, m_blocks,
+        pipeline_q, pipeline_do,
+        n_block, head, batch, m_lo, m_hi,
+        tma_bytes_K: cutlass.Constexpr[int], tma_bytes_V: cutlass.Constexpr[int],
     ):
         mK_cur = mK[None, None, head, batch]
         mV_cur = mV[None, None, head, batch]
@@ -604,28 +632,54 @@ class WanFlashBwdSm90:
         load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
         load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_do)
 
-        # K and V once per CTA, on their own single-stage barrier
-        kv_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        pipeline_kv.producer_acquire(kv_state)
-        load_K(tma_bar_ptr=pipeline_kv.producer_get_barrier(kv_state))
-        load_V(tma_bar_ptr=pipeline_kv.producer_get_barrier(kv_state))
-
-        # Q+LSE / dO+dPsum stream over all m_blocks (shared state: equal stages).
-        # First iteration peeled: K/V/Q(0) TMA may fly during the preprocess
-        # tail (PDL); LSE/dPsum/dQaccum are preprocess outputs, so wait before
-        # the first stat load.
+        # K/V are loaded once, piggybacked on the FIRST Q/dO stage barriers via
+        # extra transaction counts (FA4 idiom): the first S GEMM waits only
+        # Q(0)+K; V completes with dO(0). First iteration peeled: K/Q(0) TMA
+        # may fly during the preprocess tail (PDL); LSE/dPsum/dQaccum are
+        # preprocess outputs, so wait before the first stat load.
         q_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.Q_stage
         )
+        if const_expr(self.nsplit == 1):
+            q_state = self._load_stream(
+                q_state, pipeline_q, pipeline_do,
+                load_K, load_V, load_Q, load_dO, load_LSE, load_dPsum,
+                m_lo, m_hi, tma_bytes_K, tma_bytes_V,
+            )
+        else:
+            if m_lo < m_hi:  # a split's range can be empty
+                q_state = self._load_stream(
+                    q_state, pipeline_q, pipeline_do,
+                    load_K, load_V, load_Q, load_dO, load_LSE, load_dPsum,
+                    m_lo, m_hi, tma_bytes_K, tma_bytes_V,
+                )
+
+    @cute.jit
+    def _load_stream(
+        self, q_state, pipeline_q, pipeline_do,
+        load_K, load_V, load_Q, load_dO, load_LSE, load_dPsum,
+        m_lo, m_hi, tma_bytes_K: cutlass.Constexpr[int],
+        tma_bytes_V: cutlass.Constexpr[int],
+    ):
         pipeline_q.producer_acquire(q_state)
-        load_Q(0, producer_state=q_state)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_expect_tx(
+                pipeline_q.producer_get_barrier(q_state), tma_bytes_K
+            )
+        load_K(tma_bar_ptr=pipeline_q.producer_get_barrier(q_state))
+        load_Q(m_lo, producer_state=q_state)
         cute.arch.griddepcontrol_wait()
-        load_LSE(0, producer_state=q_state)
+        load_LSE(m_lo, producer_state=q_state)
         pipeline_do.producer_acquire(q_state)
-        load_dO(0, producer_state=q_state)
-        load_dPsum(0, producer_state=q_state)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_expect_tx(
+                pipeline_do.producer_get_barrier(q_state), tma_bytes_V
+            )
+        load_V(tma_bar_ptr=pipeline_do.producer_get_barrier(q_state))
+        load_dO(m_lo, producer_state=q_state)
+        load_dPsum(m_lo, producer_state=q_state)
         q_state.advance()
-        for m_block in cutlass.range(1, m_blocks, unroll=1):
+        for m_block in cutlass.range(m_lo + 1, m_hi, unroll=1):
             pipeline_q.producer_acquire(q_state)
             load_Q(m_block, producer_state=q_state)
             load_LSE(m_block, producer_state=q_state)
@@ -633,10 +687,11 @@ class WanFlashBwdSm90:
             load_dO(m_block, producer_state=q_state)
             load_dPsum(m_block, producer_state=q_state)
             q_state.advance()
+        return q_state
 
     # ------------------------------------------------- dQ store loop (warp 1)
     @cute.jit
-    def _dq_store(self, mdQaccum, sdQaccum, head, batch, m_blocks, tma_bytes_dQ):
+    def _dq_store(self, mdQaccum, sdQaccum, head, batch, m_lo, m_hi, tma_bytes_dQ):
         mdQaccum_cur = mdQaccum[None, head, batch]
         # ((tile_m*d/num_wg, num_wg), m_blocks) view of the flat padded buffer
         gdQaccum = cute.local_tile(
@@ -645,7 +700,7 @@ class WanFlashBwdSm90:
                                self.num_wg_dQ)),),
             (None,),
         )
-        for i in cutlass.range(m_blocks, unroll=1):
+        for i in cutlass.range(m_lo, m_hi, unroll=1):
             for wg in cutlass.range_constexpr(self.num_wg_dQ):
                 # previous bulk-add from chunk wg must have read sdQaccum out
                 cute.arch.cp_async_bulk_wait_group(
@@ -668,15 +723,23 @@ class WanFlashBwdSm90:
                     )
                 cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0, read=True)
+        if const_expr(self.nsplit > 1):
+            # release sdQaccum to the MMA WGs for the dK/dV accum epilogue
+            for wg in cutlass.range_constexpr(self.num_wg_dQ):
+                cute.arch.barrier_arrive(
+                    barrier_id=BAR_DQ_EMPTY0 + wg,
+                    number_of_threads=128 + cute.arch.WARP_SIZE,
+                )
 
     # -------------------------------------------------- consumers (2 MMA WGs)
     @cute.jit
     def _mma(
         self, mdK, mdV, sQ, sK, sV, sdO, sdS, sLSE, sdPsum, sdQaccum,
-        tma_atom_dK, tma_atom_dV, r2s_tiled_copy_dQaccum,
+        tma_atom_dK, tma_atom_dV,
+        r2s_tiled_copy_dQaccum, r2s_tiled_copy_dKVaccum,
         tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
-        pipeline_q, pipeline_do, pipeline_kv,
-        tidx, n_block, head, batch, m_blocks,
+        pipeline_q, pipeline_do,
+        tidx, n_block, head, batch, m_lo, m_hi, seqlen_k,
     ):
         wg_idx = cute.arch.make_warp_uniform(tidx // 128)
         wg_layout = cute.make_layout(self.num_wg_mma, stride=128)
@@ -747,39 +810,50 @@ class WanFlashBwdSm90:
             barrier_id=BAR_PDS, num_threads=self.num_mma_threads
         )
 
-        # K-direction ragged tail: mask columns >= seqlen_k - n_block*tile_n
-        seqlen_k = cute.size(mdK.shape[0])
+        # K-direction ragged tail: mask columns >= seqlen_k - n_block*tile_n.
+        # Only the last n_block CTA has a tail (uniform runtime skip; compiled
+        # out entirely when seqlen_k divides tile_n).
         seqlenk_col_start = seqlen_k - n_block * self.tile_n
+        need_k_mask = Boolean(seqlenk_col_start < self.tile_n)
 
-        # wait once for K/V
-        kv_cstate = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        pipeline_kv.consumer_wait(kv_cstate, pipeline_kv.consumer_try_wait(kv_cstate))
+        if const_expr(self.nsplit > 1):
+            # a split's range can be empty; its accumulators must still be
+            # defined (they contribute 0 to the gmem accumulation)
+            acc_dV.fill(0.0)
+            acc_dK.fill(0.0)
 
         c_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.Q_stage
         )
         dKV_accumulate = Boolean(False)
-        for m_block in cutlass.range(m_blocks, unroll=1):
+        for m_block in cutlass.range(m_lo, m_hi, unroll=1):
             c_state = self._mma_m_block(
                 c_state, wg_idx,
                 mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
                 copy_dS_r2s, pipeline_q, pipeline_do,
                 tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
-                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
+                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, need_k_mask,
                 PdS_barrier, dKV_accumulate,
             )
             dKV_accumulate = Boolean(True)
 
-        # ------------- epilogue: dK/dV -> bf16 -> smem (sK/sV) -> TMA store
-        acc_dK.store(acc_dK.load() * self.softmax_scale)
-        self._epilogue_dKV(
-            acc_dV, mdV, sV, acc_dK, mdK, sK,
-            tma_atom_dK, tma_atom_dV, tiled_mma_dKV,
-            tidx, n_block, head, batch,
-        )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == 4:
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+        acc_dK.store(acc_dK.load() * self.softmax_scale)
+        if const_expr(self.nsplit == 1):
+            # ---------- epilogue: dK/dV -> bf16 -> smem (sK/sV) -> TMA store
+            self._epilogue_dKV(
+                acc_dV, mdV, sV, acc_dK, mdK, sK,
+                tma_atom_dK, tma_atom_dV, tiled_mma_dKV,
+                tidx, n_block, head, batch,
+            )
+            if warp_idx == 4:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+        else:
+            # ---------- epilogue: fp32 gmem accumulation (split-M)
+            self._epilogue_dKV_accum(
+                acc_dV, mdV, acc_dK, mdK, sdQaccum, r2s_tiled_copy_dKVaccum,
+                tidx, wg_idx, warp_idx, n_block, head, batch,
+            )
 
     @cute.jit
     def _mma_m_block(
@@ -787,7 +861,7 @@ class WanFlashBwdSm90:
         mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
         copy_dS_r2s, pipeline_q, pipeline_do,
         tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
-        thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
+        thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, need_k_mask: Boolean,
         PdS_barrier, dKV_accumulate: Boolean,
     ):
         smem_idx = c_state.index
@@ -801,21 +875,24 @@ class WanFlashBwdSm90:
         pipeline_do.consumer_wait(c_state, pipeline_do.consumer_try_wait(c_state))
         acc_dP = mma_dov_fn(A_idx=smem_idx, wg_wait=1)  # waits GEMM 1
 
-        # K-tail mask (predicated selects; the m-tail is masked for free by the
-        # +inf LSE sentinel written in preprocess)
+        # K-tail mask (m-tail is masked for free by the +inf LSE sentinel
+        # written in preprocess). Only the last n_block CTA runs the selects;
+        # compiled out entirely when seqlen_k % tile_n == 0.
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
-        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
-        tScS_mn = layout_utils.reshape_acc_to_mn(
-            thr_mma_SdP.partition_C(cS), transpose=True
-        )
-        t0ScS_mn = layout_utils.reshape_acc_to_mn(
-            tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
-        )
-        limit = seqlenk_col_start - tScS_mn[0][0]
-        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-            oob = t0ScS_mn[0, c][0] >= limit
-            for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
-                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+        if const_expr(self.seqlen_k_static % self.tile_n != 0):
+            if need_k_mask:
+                cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+                tScS_mn = layout_utils.reshape_acc_to_mn(
+                    thr_mma_SdP.partition_C(cS), transpose=True
+                )
+                t0ScS_mn = layout_utils.reshape_acc_to_mn(
+                    tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
+                )
+                limit = seqlenk_col_start - tScS_mn[0][0]
+                for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                    oob = t0ScS_mn[0, c][0] >= limit
+                    for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+                        acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
 
         # [Pointwise 1] P = exp2(S*scale_log2 - lse_log2)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -921,35 +998,90 @@ class WanFlashBwdSm90:
             store_dK()
             cute.arch.cp_async_bulk_commit_group()
 
+    @cute.jit
+    def _epilogue_dKV_accum(
+        self, acc_dV, mdVaccum, acc_dK, mdKaccum, sdQaccum,
+        r2s_tiled_copy_dKVaccum, tidx, wg_idx, warp_idx, n_block, head, batch,
+    ):
+        """Split-M epilogue: bulk-reduce-add fp32 dK/dV fragments into the flat
+        gmem accum buffers, one WG chunk at a time through the (now idle)
+        sdQaccum smem. Element order = dKV accumulator fragment order; the
+        dKV postprocess kernel undoes it."""
+        epi_barrier = pipeline.NamedBarrier(
+            barrier_id=BAR_EPI, num_threads=self.num_mma_threads
+        )
+        chunk = self.tile_n * self.head_dim // self.num_wg_mma
+        s_chunk = cute.make_tensor(sdQaccum.iterator, cute.make_layout(chunk))
+        thr_copy = r2s_tiled_copy_dKVaccum.get_slice(tidx % 128)
+        t_s = thr_copy.partition_D(s_chunk)
+        gdVaccum = cute.local_tile(mdVaccum[None, head, batch], (chunk,), (None,))
+        gdKaccum = cute.local_tile(mdKaccum[None, head, batch], (chunk,), (None,))
+
+        # the store warp's last dQ bulk-adds must be done reading sdQaccum
+        cute.arch.barrier(
+            barrier_id=BAR_DQ_EMPTY0 + wg_idx,
+            number_of_threads=128 + cute.arch.WARP_SIZE,
+        )
+        for acc, g in ((acc_dV, gdVaccum), (acc_dK, gdKaccum)):
+            for wg in cutlass.range_constexpr(self.num_wg_mma):
+                if wg_idx == wg:
+                    t_r = cute.make_tensor(acc.iterator, cute.make_layout(t_s.shape))
+                    cute.autovec_copy(t_r, t_s)
+                    cute.arch.fence_view_async_shared()
+                epi_barrier.arrive_and_wait()
+                if warp_idx == 4:
+                    with cute.arch.elect_one():
+                        copy_utils.cpasync_reduce_bulk_add_f32(
+                            s_chunk.iterator,
+                            g[None, n_block * self.num_wg_mma + wg].iterator,
+                            chunk * Float32.width // 8,
+                        )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                epi_barrier.arrive_and_wait()
+
 
 # =====================================================================
-# Phase C: postprocess (dQaccum fp32 fragment-order -> *scale -> bf16 dq)
+# Phase C: postprocess (fp32 accum in fragment order -> *scale -> bf16)
 # =====================================================================
 class WanFlashBwdPostprocessSm90:
-    """Must be constructed with the same (tile_m, num_wg, AtomLayoutMdQ,
-    dQ_swapAB) as the main kernel: the gmem dQaccum element order is the dQ
-    WGMMA accumulator fragment order."""
+    """Converts a flat fp32 accumulation buffer whose element order is a
+    WGMMA accumulator fragment order into a bf16 (b, s, h, d) tensor.
+    Two instantiations, matching the main kernel's MMAs:
+      dQ:    tile_rows=tile_m, atom_m=AtomLayoutMdQ=1, swapAB=dQ_swapAB,
+             scale=softmax_scale
+      dK/dV: tile_rows=tile_n, atom_m=AtomLayoutNdKV=2, swapAB=False,
+             scale=1.0 (dK was scaled in the main epilogue)"""
 
-    def __init__(self, head_dim: int = 128, tile_m: int = 80, num_wg: int = 2):
+    def __init__(
+        self,
+        head_dim: int = 128,
+        tile_rows: int = 80,
+        num_wg: int = 2,
+        atom_m: int = 1,
+        swapAB: bool = False,
+        scale: float = 1.0,
+    ):
+        assert num_wg % atom_m == 0
         self.head_dim = head_dim
-        self.tile_m = tile_m
+        self.tile_rows = tile_rows
         self.num_wg = num_wg
+        self.atom_m = atom_m
+        self.swapAB = swapAB
+        self.scale = scale
         self.num_threads = 128 * num_wg
-        self.AtomLayoutMdQ = 1
-        self.dQ_swapAB = tile_m % 64 != 0
         self.dtype = BFloat16
-        self.softmax_scale = 1.0 / math.sqrt(head_dim)
 
     def _make_tiled_mma(self):
-        atom = (self.AtomLayoutMdQ, self.num_wg // self.AtomLayoutMdQ)
-        tiler = (self.tile_m // atom[0], self.head_dim // atom[1])
+        atom = (self.atom_m, self.num_wg // self.atom_m)
+        tiler = (self.tile_rows // atom[0], self.head_dim // atom[1])
         return cutlass.utils.hopper_helpers.make_trivial_tiled_mma(
             self.dtype, self.dtype,
             warpgroup.OperandMajorMode.K,  # majorness irrelevant: accum only
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(atom if not self.dQ_swapAB else atom[::-1]) + (1,),
-            tiler_mn=tiler if not self.dQ_swapAB else tiler[::-1],
+            atom_layout_mnk=(atom if not self.swapAB else atom[::-1]) + (1,),
+            tiler_mn=tiler if not self.swapAB else tiler[::-1],
         )
 
     @cute.jit
@@ -965,7 +1097,7 @@ class WanFlashBwdPostprocessSm90:
         tiled_mma = self._make_tiled_mma()
 
         # G2S: flat 128-bit cp.async chunks
-        assert (self.tile_m * self.head_dim // 4) % self.num_threads == 0
+        assert (self.tile_rows * self.head_dim // 4) % self.num_threads == 0
         g2s_tiled_copy = cute.make_tiled_copy_tv(
             cute.make_copy_atom(
                 cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -982,12 +1114,11 @@ class WanFlashBwdPostprocessSm90:
             cute.make_layout(4),
         )
         sdQaccum_layout = cute.make_layout(
-            (self.tile_m * self.head_dim // self.num_wg, self.num_wg)
+            (self.tile_rows * self.head_dim // self.num_wg, self.num_wg)
         )
-        wg_d_dQ = self.num_wg // self.AtomLayoutMdQ
         sdQ_layout = sm90_utils.make_smem_layout(
-            self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.head_dim),
-            None, major_mode_size=self.head_dim // wg_d_dQ,
+            self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_rows, self.head_dim),
+            None, major_mode_size=self.head_dim // (self.num_wg // self.atom_m),
         )
         num_copy_elems = 128 // self.dtype.width
         threads_per_row = math.gcd(128, self.head_dim) // num_copy_elems
@@ -995,7 +1126,7 @@ class WanFlashBwdPostprocessSm90:
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
 
-        m_blocks = cute.ceil_div(cute.size(mdQ.shape[0]), self.tile_m)
+        m_blocks = cute.ceil_div(cute.size(mdQ.shape[0]), self.tile_rows)
         grid = (m_blocks, cute.size(mdQ.shape[2]), cute.size(mdQ.shape[3]))
         self.kernel(
             mdQaccum, mdQ, tiled_mma, sdQaccum_layout, sdQ_layout,
@@ -1030,10 +1161,10 @@ class WanFlashBwdPostprocessSm90:
 
         mdQaccum_cur = mdQaccum[None, head, batch]
         gdQaccum = cute.local_tile(
-            mdQaccum_cur, (self.tile_m * self.head_dim,), (m_block,)
+            mdQaccum_cur, (self.tile_rows * self.head_dim,), (m_block,)
         )
         mdQ_cur = mdQ[None, None, head, batch]
-        gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.head_dim), (m_block, 0))
+        gdQ = cute.local_tile(mdQ_cur, (self.tile_rows, self.head_dim), (m_block, 0))
 
         # 1) G -> S (cp.async, coalesced)
         g2s_thr = g2s_tiled_copy.get_slice(tidx)
@@ -1047,26 +1178,26 @@ class WanFlashBwdPostprocessSm90:
         # 2) S -> R: reinterpret this thread's flat slots as its accum fragment
         s2r_thr = s2r_tiled_copy.get_slice(tidx)
         tdQsdQaccum = s2r_thr.partition_S(sdQaccum)
-        tile_shape = (self.tile_m, self.head_dim)
+        tile_shape = (self.tile_rows, self.head_dim)
         acc_shape = tiled_mma.partition_shape_C(
-            tile_shape if const_expr(not self.dQ_swapAB) else tile_shape[::-1]
+            tile_shape if const_expr(not self.swapAB) else tile_shape[::-1]
         )
         acc = cute.make_rmem_tensor(acc_shape, Float32)
         tdQrdQaccum = cute.make_tensor(
             acc.iterator, cute.make_layout(tdQsdQaccum.shape)
         )
         cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
-        acc.store(acc.load() * self.softmax_scale)
+        acc.store(acc.load() * self.scale)
 
-        # 3) R -> S via StMatrix (transpose when dQ_swapAB), converting to bf16
+        # 3) R -> S via StMatrix (transpose when swapAB), converting to bf16
         cute.arch.barrier()  # everyone done reading sdQaccum before recast write
         copy_dQ_r2s, _, _ = copy_utils.get_smem_store_C(
-            tiled_mma, sdQ if const_expr(not self.dQ_swapAB) else sdQt,
-            tidx, transpose=self.dQ_swapAB,
+            tiled_mma, sdQ if const_expr(not self.swapAB) else sdQt,
+            tidx, transpose=self.swapAB,
         )
         copy_dQ_r2s(acc, dst_idx=None)
 
-        # 4) S -> R -> G, coalesced, m-tail predicated
+        # 4) S -> R -> G, coalesced, row-tail predicated
         cute.arch.barrier()
         gmem_thr = gmem_tiled_copy_dQ.get_slice(tidx)
         tdQsdQ = gmem_thr.partition_S(sdQ)
@@ -1075,7 +1206,7 @@ class WanFlashBwdPostprocessSm90:
         cute.autovec_copy(tdQsdQ, tdQrdQ)
         cdQ = cute.make_identity_tensor(tile_shape)
         tdQcdQ = gmem_thr.partition_S(cdQ)
-        row_limit = seqlen_q - m_block * self.tile_m
+        row_limit = seqlen_q - m_block * self.tile_rows
         for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
             if tdQcdQ[0, rest_m, 0][0] < row_limit:
                 cute.copy(

@@ -42,11 +42,18 @@ class BwdFeatures:
                 64 = the causal-config alternative (no dQ_swapAB).
     tile_n      KV tile; fixed 128 (= 64 * 2 MMA warpgroups under SdP_swapAB).
     num_stages  Q/dO/dS smem pipeline depth (2 = FA4 default).
+    nsplit      Split-M for tiny-KV (cross-attn) shapes: each CTA handles a
+                chunk of m_blocks; dK/dV go through fp32 gmem accumulation +
+                a convert kernel (docs/SPECIALIZATION.md B5). 0 = auto (1 for
+                self shapes; picked for >=95% wave efficiency when the base
+                grid underfills the GPU). NOTE: nsplit > 1 makes dk/dv
+                nondeterministic (atomic add order), like dq already is.
     """
 
     tile_m: int = 80
     tile_n: int = 128
     num_stages: int = 2
+    nsplit: int = 0
 
 
 _current = FwdFeatures()

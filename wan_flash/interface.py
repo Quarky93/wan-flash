@@ -62,6 +62,26 @@ def wan_flash_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     return o, lse
 
 
+def _auto_nsplit(base_ctas: int, m_blocks: int, sm_count: int = 132) -> int:
+    """Split-M factor for the bwd main kernel (docs/SPECIALIZATION.md B5).
+    1 when the (n_blocks*h*b) grid fills the GPU well; otherwise the smallest
+    split with >= 95% wave efficiency (fills partial waves)."""
+
+    def eff(ctas):
+        return ctas / (sm_count * -(-ctas // sm_count))
+
+    if eff(base_ctas) >= 0.85:
+        return 1
+    best_k, best_eff = 1, 0.0
+    for cand in range(1, min(m_blocks, 64) + 1):
+        e = eff(base_ctas * cand)
+        if base_ctas * cand >= sm_count and e >= 0.95:
+            return cand
+        if e > best_eff:
+            best_k, best_eff = cand, e
+    return best_k
+
+
 def wan_flash_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -94,6 +114,11 @@ def wan_flash_bwd(
     f = features.get_bwd()
     tile_m = f.tile_m
     sq_rounded = (sq + tile_m - 1) // tile_m * tile_m
+    m_blocks = sq_rounded // tile_m
+    n_blocks = (skv + f.tile_n - 1) // f.tile_n
+    skv_rounded = n_blocks * f.tile_n
+    nsplit = f.nsplit if f.nsplit > 0 else _auto_nsplit(n_blocks * h * b, m_blocks)
+    nsplit = min(nsplit, m_blocks)
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -101,8 +126,15 @@ def wan_flash_bwd(
     dpsum = torch.empty(b, h, sq_rounded, device=q.device, dtype=torch.float32)
     lse_log2 = torch.empty(b, h, sq_rounded, device=q.device, dtype=torch.float32)
     dq_accum = torch.empty(b, h, sq_rounded * d, device=q.device, dtype=torch.float32)
+    if nsplit > 1:
+        # split-M: dK/dV accumulate in fp32 gmem (must start zeroed)
+        dk_accum = torch.zeros(b, h, skv_rounded * d, device=q.device, dtype=torch.float32)
+        dv_accum = torch.zeros_like(dk_accum)
+        main_dk, main_dv = dk_accum, dv_accum
+    else:
+        main_dk, main_dv = dk, dv
 
-    key = (b, sq, skv, h, d, f)
+    key = (b, sq, skv, h, d, f, nsplit)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     pre_args = (
         _to_cute(o), _to_cute(do), _to_cute(lse),
@@ -111,26 +143,42 @@ def wan_flash_bwd(
     main_args = (
         _to_cute(q), _to_cute(k), _to_cute(v), _to_cute(do),
         _to_cute(lse_log2), _to_cute(dpsum), _to_cute(dq_accum),
-        _to_cute(dk), _to_cute(dv),
+        _to_cute(main_dk), _to_cute(main_dv),
     )
     post_args = (_to_cute(dq_accum), _to_cute(dq))
+    if nsplit > 1:
+        post_dk_args = (_to_cute(dk_accum), _to_cute(dk))
+        post_dv_args = (_to_cute(dv_accum), _to_cute(dv))
     if key not in _bwd_compile_cache:
         pre = WanFlashBwdPreprocessSm90(head_dim=d, tile_m=tile_m)
         main = WanFlashBwdSm90(
-            head_dim=d, tile_m=tile_m, tile_n=f.tile_n, num_stages=f.num_stages
+            head_dim=d, tile_m=tile_m, tile_n=f.tile_n, num_stages=f.num_stages,
+            nsplit=nsplit,
         )
         post = WanFlashBwdPostprocessSm90(
-            head_dim=d, tile_m=tile_m, num_wg=main.num_wg_dQ
+            head_dim=d, tile_rows=tile_m, num_wg=main.num_wg_dQ,
+            atom_m=main.AtomLayoutMdQ, swapAB=main.dQ_swapAB,
+            scale=main.softmax_scale,
         )
-        _bwd_compile_cache[key] = (
+        compiled = [
             cute.compile(pre, *pre_args, stream),
             cute.compile(main, *main_args, stream),
             cute.compile(post, *post_args, stream),
-        )
-    pre_c, main_c, post_c = _bwd_compile_cache[key]
-    pre_c(*pre_args, stream)
-    main_c(*main_args, stream)
-    post_c(*post_args, stream)
+        ]
+        if nsplit > 1:
+            post_dkv = WanFlashBwdPostprocessSm90(
+                head_dim=d, tile_rows=f.tile_n, num_wg=main.num_wg_mma,
+                atom_m=main.AtomLayoutNdKV, swapAB=main.dKV_swapAB, scale=1.0,
+            )
+            compiled.append(cute.compile(post_dkv, *post_dk_args, stream))
+        _bwd_compile_cache[key] = compiled
+    compiled = _bwd_compile_cache[key]
+    compiled[0](*pre_args, stream)
+    compiled[1](*main_args, stream)
+    compiled[2](*post_args, stream)
+    if nsplit > 1:
+        compiled[3](*post_dk_args, stream)
+        compiled[3](*post_dv_args, stream)
     return dq, dk, dv
 
 
