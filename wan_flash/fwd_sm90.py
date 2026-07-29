@@ -55,7 +55,7 @@ class WanFlashFwdSm90:
         tile_n: int = 128,
         num_stages: int = 2,
         rescale_skip_threshold: float = 0.0,
-        intra_wg_overlap: bool = False,
+        intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
     ):
         assert head_dim % 16 == 0 and head_dim <= 256
@@ -322,6 +322,29 @@ class WanFlashFwdSm90:
         tOrP_view = cute.make_tensor(tOrP.iterator, cute.make_layout(acc_S.shape))
         tOrP_view.store(acc_S.load().to(self.dtype))
 
+    # ---- consumer-warpgroup ping-pong (FA3-style warp scheduler barrier) ----
+    @cute.jit
+    def mma_init(self, wg_idx):
+        if const_expr(self.use_scheduler_barrier):
+            if wg_idx == 0:
+                cute.arch.barrier_arrive(
+                    barrier_id=BAR_WG_SCHED1, number_of_threads=2 * 128
+                )
+
+    @cute.jit
+    def warp_scheduler_barrier_sync(self, wg_idx):
+        if const_expr(self.use_scheduler_barrier):
+            cute.arch.barrier(
+                barrier_id=BAR_WG_SCHED1 + wg_idx, number_of_threads=2 * 128
+            )
+
+    @cute.jit
+    def warp_scheduler_barrier_arrive(self, wg_idx):
+        if const_expr(self.use_scheduler_barrier):
+            cute.arch.barrier_arrive(
+                barrier_id=BAR_WG_SCHED1 + (1 - wg_idx), number_of_threads=2 * 128
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -449,15 +472,36 @@ class WanFlashFwdSm90:
                 kv_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_stages
                 )
-                for i in cutlass.range(n_blocks, unroll=1):
-                    n_block = n_blocks - 1 - i
+                if const_expr(self.intra_wg_overlap):
+                    # K runs one block ahead of V, matching the consumer's
+                    # QK(i+1)-before-PV(i) order.
                     pipeline_k.producer_acquire(kv_state)
-                    load_K(src_idx=n_block, producer_state=kv_state)
+                    load_K(src_idx=n_blocks - 1, producer_state=kv_state)
                     pipeline_k.producer_commit(kv_state)
+                    for i in cutlass.range(n_blocks - 1, unroll=1):
+                        n_block_prev = n_blocks - 1 - i
+                        kv_state_prev = kv_state.clone()
+                        kv_state.advance()
+                        pipeline_k.producer_acquire(kv_state)
+                        load_K(src_idx=n_block_prev - 1, producer_state=kv_state)
+                        pipeline_k.producer_commit(kv_state)
+                        pipeline_v.producer_acquire(kv_state_prev)
+                        load_V(src_idx=n_block_prev, producer_state=kv_state_prev)
+                        pipeline_v.producer_commit(kv_state_prev)
                     pipeline_v.producer_acquire(kv_state)
-                    load_V(src_idx=n_block, producer_state=kv_state)
+                    load_V(src_idx=0, producer_state=kv_state)
                     pipeline_v.producer_commit(kv_state)
                     kv_state.advance()
+                else:
+                    for i in cutlass.range(n_blocks, unroll=1):
+                        n_block = n_blocks - 1 - i
+                        pipeline_k.producer_acquire(kv_state)
+                        load_K(src_idx=n_block, producer_state=kv_state)
+                        pipeline_k.producer_commit(kv_state)
+                        pipeline_v.producer_acquire(kv_state)
+                        load_V(src_idx=n_block, producer_state=kv_state)
+                        pipeline_v.producer_commit(kv_state)
+                        kv_state.advance()
                 pipeline_v.producer_tail(kv_state)
         else:
             # ======================= CONSUMER =======================
@@ -495,33 +539,76 @@ class WanFlashFwdSm90:
             kv_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages
             )
+            self.mma_init(wg_idx)
             pipeline_q.consumer_wait(q_state, pipeline_q.consumer_try_wait(q_state))
 
-            # ---- peeled first block: the ragged KV tail (masked), is_first
-            pipeline_k.consumer_wait(kv_state, pipeline_k.consumer_try_wait(kv_state))
-            acc_S = mma_qk_fn(B_idx=kv_state.index, wg_wait=0)
-            pipeline_k.consumer_release(kv_state)
-            if const_expr(seqlen_k % self.tile_n != 0):
-                self.apply_seqlenk_mask(acc_S, tiled_mma_qk, thr_mma_qk, Int32(n_tail))
-            self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=True)
-            self.convert_P(acc_S, tOrP)
-            pipeline_v.consumer_wait(kv_state, pipeline_v.consumer_try_wait(kv_state))
-            mma_pv_fn(zero_init=True, B_idx=kv_state.index, wg_wait=0)
-            pipeline_v.consumer_release(kv_state)
-            kv_state.advance()
-
-            # ---- clean unmasked mainloop (descending blocks n_blocks-2 .. 0)
-            for i in cutlass.range(n_blocks - 1, unroll=1):
+            if const_expr(self.intra_wg_overlap):
+                # =========== FA4-style intra-warpgroup overlap ===========
+                # QK of block i+1 and PV of block i are both in flight while
+                # the softmax exp2 of block i+1 runs; the two consumer WGs
+                # ping-pong their WGMMA-issue windows via named barriers.
+                acc_O.fill(0.0)
+                # peeled first (masked, is_first) block: QK + softmax only
                 pipeline_k.consumer_wait(kv_state, pipeline_k.consumer_try_wait(kv_state))
                 acc_S = mma_qk_fn(B_idx=kv_state.index, wg_wait=0)
                 pipeline_k.consumer_release(kv_state)
-                self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=False)
-                self.rescale_O(acc_O, row_scale)
+                if const_expr(seqlen_k % self.tile_n != 0):
+                    self.apply_seqlenk_mask(acc_S, tiled_mma_qk, thr_mma_qk, Int32(n_tail))
+                self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=True)
                 self.convert_P(acc_S, tOrP)
+
+                for i in cutlass.range(n_blocks - 1, unroll=1):
+                    kv_state_v = kv_state.clone()
+                    kv_state.advance()
+                    pipeline_k.consumer_wait(
+                        kv_state, pipeline_k.consumer_try_wait(kv_state)
+                    )
+                    self.warp_scheduler_barrier_sync(wg_idx)
+                    acc_S = mma_qk_fn(B_idx=kv_state.index, wg_wait=-1)
+                    pipeline_v.consumer_wait(
+                        kv_state_v, pipeline_v.consumer_try_wait(kv_state_v)
+                    )
+                    mma_pv_fn(zero_init=False, B_idx=kv_state_v.index, wg_wait=-1)
+                    self.warp_scheduler_barrier_arrive(wg_idx)
+                    warpgroup.wait_group(1)  # QK done; PV still in flight
+                    pipeline_k.consumer_release(kv_state)
+                    self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=False)
+                    warpgroup.wait_group(0)  # drain PV
+                    pipeline_v.consumer_release(kv_state_v)
+                    self.convert_P(acc_S, tOrP)
+                    self.rescale_O(acc_O, row_scale)
+
+                # trailing PV of the last consumed block
                 pipeline_v.consumer_wait(kv_state, pipeline_v.consumer_try_wait(kv_state))
                 mma_pv_fn(zero_init=False, B_idx=kv_state.index, wg_wait=0)
                 pipeline_v.consumer_release(kv_state)
+            else:
+                # ================= simple non-overlap loop =================
+                # ---- peeled first block: the ragged KV tail (masked), is_first
+                pipeline_k.consumer_wait(kv_state, pipeline_k.consumer_try_wait(kv_state))
+                acc_S = mma_qk_fn(B_idx=kv_state.index, wg_wait=0)
+                pipeline_k.consumer_release(kv_state)
+                if const_expr(seqlen_k % self.tile_n != 0):
+                    self.apply_seqlenk_mask(acc_S, tiled_mma_qk, thr_mma_qk, Int32(n_tail))
+                self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=True)
+                self.convert_P(acc_S, tOrP)
+                pipeline_v.consumer_wait(kv_state, pipeline_v.consumer_try_wait(kv_state))
+                mma_pv_fn(zero_init=True, B_idx=kv_state.index, wg_wait=0)
+                pipeline_v.consumer_release(kv_state)
                 kv_state.advance()
+
+                # ---- clean unmasked mainloop (descending blocks n_blocks-2 .. 0)
+                for i in cutlass.range(n_blocks - 1, unroll=1):
+                    pipeline_k.consumer_wait(kv_state, pipeline_k.consumer_try_wait(kv_state))
+                    acc_S = mma_qk_fn(B_idx=kv_state.index, wg_wait=0)
+                    pipeline_k.consumer_release(kv_state)
+                    self.softmax_step(acc_S, row_max, row_sum, row_scale, is_first=False)
+                    self.rescale_O(acc_O, row_scale)
+                    self.convert_P(acc_S, tOrP)
+                    pipeline_v.consumer_wait(kv_state, pipeline_v.consumer_try_wait(kv_state))
+                    mma_pv_fn(zero_init=False, B_idx=kv_state.index, wg_wait=0)
+                    pipeline_v.consumer_release(kv_state)
+                    kv_state.advance()
 
             # ---- finalize: quad-reduce row_sum, compute LSE + 1/sum scale
             for r in cutlass.range_constexpr(num_rows):
