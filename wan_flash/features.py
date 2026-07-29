@@ -23,13 +23,14 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class FwdFeatures:
-    rescale_skip_threshold: float = 0.0
-    intra_wg_overlap: bool = True
+    # defaults = measured winners at Wan shapes (docs/FEATURES.md for numbers)
+    rescale_skip_threshold: float = 8.0  # +2% self; exact math (max-shift inv.)
+    intra_wg_overlap: bool = True        # +14% self (562 -> 641 TFLOP/s)
     mma_pv_is_rs: bool = True
-    num_stages: int = 2
+    num_stages: int = 2                  # 3 was ~flat, no smem headroom left
     tile_m: int = 128
-    tile_n: int = 128
-    scheduler: str = "single"
+    tile_n: int = 128                    # 120/144/160/176/192 all measured slower
+    scheduler: str = "persistent"        # +1.5% self@32760, +15% cross
 
 
 _current = FwdFeatures()

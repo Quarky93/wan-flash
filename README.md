@@ -43,8 +43,22 @@ docs/FEATURES.md    per-feature A/B verdicts with measurements
 
 ## Status
 
-Under active development — see `docs/FEATURES.md` for what is implemented and
-how it currently measures against FA3/FA4 at each shape.
+**Forward: done and green.** `tests/test_fwd.py` passes (fast battery + true
+shapes behind `WAN_FLASH_SLOW_TESTS=1`); error vs the chunked-fp32 oracle sits
+at the bf16 floor (rel_l2 ≈ 2.2e-3, same as FA3; LSE ≤ 1.5e-6).
+
+H100 SXM, forward, defaults (persistent scheduler + rescale-skip 8.0 +
+intra-WG overlap, 128×128, 2 stages):
+
+| shape | wan-flash | vs FA3 | vs FA4 |
+|---|---|---|---|
+| self h12 S=32760 | 662.5 TFLOP/s | 0.972x | 1.009x |
+| self h12 S=75600 | 666.9 TFLOP/s | 0.971x | 1.004x |
+| cross h12 S=75600×512 | 536.3 TFLOP/s | 1.003x | 1.175x |
+| cross h40 S=75600×512 | 529.8 TFLOP/s | 1.011x | 1.170x |
+
+Full 8-shape table and per-feature verdicts: `docs/FEATURES.md`.
+Backward: not yet started (`bwd_sm90.py` pending).
 
 ## License / provenance
 
