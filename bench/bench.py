@@ -54,6 +54,38 @@ def get_impl(name, feature_overrides=None):
     raise ValueError(name)
 
 
+def get_bwd_impl(name, feature_overrides=None):
+    """Returns bwd_fn(q, k, v, o, lse, do) -> (dq, dk, dv). Raw backward calls
+    (FA3 _flash_attn_backward / FA4 _flash_attn_bwd / ours), each with its
+    natural per-call allocation behavior."""
+    if name == "fa3":
+        import flash_attn_interface as fa3
+
+        def fa3_bwd(q, k, v, o, lse, do):
+            dq, dk, dv = (torch.empty_like(t) for t in (q, k, v))
+            fa3._flash_attn_backward(
+                do, q, k, v, o, lse, None, None, None, None, None, None,
+                dq, dk, dv, softmax_scale=q.shape[-1] ** (-0.5),
+                is_causal=False, deterministic=False,
+            )
+            return dq, dk, dv
+
+        return fa3_bwd
+    if name == "fa4":
+        from flash_attn.cute import interface as fa4i
+
+        return lambda q, k, v, o, lse, do: fa4i._flash_attn_bwd(q, k, v, o, do, lse)
+    if name == "wan":
+        from wan_flash.interface import wan_flash_bwd
+
+        if feature_overrides:
+            from wan_flash import features
+
+            features.set_bwd_overrides(**feature_overrides)
+        return lambda q, k, v, o, lse, do: wan_flash_bwd(q, k, v, o, lse, do)
+    raise ValueError(name)
+
+
 def tflops(shape, mode, ms):
     fl = 4.0 * shape.b * shape.h * shape.sq * shape.skv * shape.d
     if mode == "bwd":
@@ -72,24 +104,44 @@ def main():
     shapes = {"primary": PRIMARY, "all": ALL_SHAPES,
               "self12": [s for s in PRIMARY if s.kind == "self"]}[args.shapes]
     rows = []
-    for shape in shapes:
-        base_ms = None
-        for name in args.impl:
-            try:
-                fn = get_impl(name)
+    for mode in args.modes:
+        for shape in shapes:
+            base_ms = None
+            bwd_inputs = None
+            if mode == "bwd":
+                # identical o/lse/do for every impl, from FA3's forward
+                import flash_attn_interface as fa3
+
                 q, k, v = make_qkv(shape)
-                fn(q, k, v)  # warmup/JIT
-                torch.cuda.synchronize()
-                ms = do_bench(lambda: fn(q, k, v), warmup=WARMUP_MS, rep=REP_MS)
-                if name == "fa3":
-                    base_ms = ms
-                sp = f" ({base_ms / ms:5.3f}x)" if base_ms and name != "fa3" else ""
-                print(f"{name:6s} {shape.name:26s} fwd {ms:9.3f} ms "
-                      f"{tflops(shape, 'fwd', ms):6.1f} TFLOP/s{sp}")
-                rows.append({"impl": name, "shape": shape.name, "mode": "fwd", "ms": ms})
-            except Exception as e:
-                print(f"{name:6s} {shape.name:26s} fwd FAILED: {type(e).__name__}: {str(e)[:120]}")
-        print()
+                o, lse = fa3._flash_attn_forward(q, k, v)[:2]
+                torch.manual_seed(1)
+                do = torch.randn_like(q)
+                bwd_inputs = (q, k, v, o, lse, do)
+            for name in args.impl:
+                try:
+                    if mode == "fwd":
+                        fn = get_impl(name)
+                        q, k, v = make_qkv(shape)
+                        fn(q, k, v)  # warmup/JIT
+                        torch.cuda.synchronize()
+                        ms = do_bench(lambda: fn(q, k, v), warmup=WARMUP_MS, rep=REP_MS)
+                    else:
+                        fn = get_bwd_impl(name)
+                        fn(*bwd_inputs)  # warmup/JIT
+                        torch.cuda.synchronize()
+                        ms = do_bench(lambda: fn(*bwd_inputs),
+                                      warmup=WARMUP_MS, rep=REP_MS)
+                    if name == "fa3":
+                        base_ms = ms
+                    sp = f" ({base_ms / ms:5.3f}x)" if base_ms and name != "fa3" else ""
+                    print(f"{name:6s} {shape.name:26s} {mode} {ms:9.3f} ms "
+                          f"{tflops(shape, mode, ms):6.1f} TFLOP/s{sp}")
+                    rows.append({"impl": name, "shape": shape.name, "mode": mode,
+                                 "ms": ms})
+                except Exception as e:
+                    print(f"{name:6s} {shape.name:26s} {mode} FAILED: "
+                          f"{type(e).__name__}: {str(e)[:120]}")
+            print()
     out = pathlib.Path(args.out)
     out.mkdir(exist_ok=True)
     (out / f"bench_{time.strftime('%Y%m%d_%H%M%S')}.json").write_text(json.dumps(rows, indent=1))

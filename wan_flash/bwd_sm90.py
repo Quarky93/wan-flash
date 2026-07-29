@@ -40,10 +40,41 @@ from cutlass.utils import LayoutEnum
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+
 from quack import sm90_utils, copy_utils, layout_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 LOG2_E = math.log2(math.e)
+
+
+@dsl_user_op
+def _cvt_f32x2_bf16x2(a, b, *, loc=None, ip=None) -> cutlass.Int32:
+    """Pack two fp32 into one bf16x2 register (cvt.rn.bf16x2.f32 d, hi, lo)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _cvt_bf16_frag(src: cute.Tensor) -> cute.Tensor:
+    """fp32 fragment -> bf16 fragment via packed converts. TensorSSA .to()
+    emits one scalar cvt per element at our (non-128x128) accumulator shapes;
+    this is the FA3/FA4 packed idiom."""
+    dst = cute.make_fragment_like(src, BFloat16)
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = _cvt_f32x2_bf16x2(src[2 * i], src[2 * i + 1])
+    return dst
 
 # named barriers (0 is reserved for sync_threads)
 BAR_PDS = 1          # sequences the sdS buffer between the two MMA WGs
@@ -99,7 +130,8 @@ class WanFlashBwdPreprocessSm90:
         self.kernel(
             mO, mdO, mLSE, mdPsum, mLSElog2, mdQaccum,
             gmem_tiled_copy_O, gmem_tiled_copy_dQaccum,
-        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream,
+                 use_pdl=True)
 
     @cute.kernel
     def kernel(
@@ -117,6 +149,9 @@ class WanFlashBwdPreprocessSm90:
         m_block, head, batch = cute.arch.block_idx()
         seqlen_q = cute.size(mO.shape[0])
         seqlen_limit = seqlen_q - m_block * self.tile_m  # rows >= it are OOB
+
+        # PDL: O/dO/LSE come from the upstream kernel; wait before reading
+        cute.arch.griddepcontrol_wait()
 
         mO_cur = mO[None, None, head, batch]
         mdO_cur = mdO[None, None, head, batch]
@@ -146,6 +181,10 @@ class WanFlashBwdPreprocessSm90:
             if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
                 copy_utils.copy(tOgO[None, m, None], tOrO[None, m, None])
                 copy_utils.copy(tOgdO[None, m, None], tOrdO[None, m, None])
+
+        # O/dO/LSE are in registers: let the main kernel start its prologue
+        # (its griddepcontrol_wait before load_LSE orders our stores)
+        cute.arch.griddepcontrol_launch_dependents()
 
         # D = rowsum(O*dO) fp32: intra-thread reduce over the k chunk, then
         # butterfly across the threads_per_row lanes sharing the row
@@ -404,6 +443,7 @@ class WanFlashBwdSm90:
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=True,
         )
 
     # -------------------------------------------------------------- device
@@ -570,11 +610,22 @@ class WanFlashBwdSm90:
         load_K(tma_bar_ptr=pipeline_kv.producer_get_barrier(kv_state))
         load_V(tma_bar_ptr=pipeline_kv.producer_get_barrier(kv_state))
 
-        # Q+LSE / dO+dPsum stream over all m_blocks (shared state: equal stages)
+        # Q+LSE / dO+dPsum stream over all m_blocks (shared state: equal stages).
+        # First iteration peeled: K/V/Q(0) TMA may fly during the preprocess
+        # tail (PDL); LSE/dPsum/dQaccum are preprocess outputs, so wait before
+        # the first stat load.
         q_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.Q_stage
         )
-        for m_block in cutlass.range(m_blocks, unroll=1):
+        pipeline_q.producer_acquire(q_state)
+        load_Q(0, producer_state=q_state)
+        cute.arch.griddepcontrol_wait()
+        load_LSE(0, producer_state=q_state)
+        pipeline_do.producer_acquire(q_state)
+        load_dO(0, producer_state=q_state)
+        load_dPsum(0, producer_state=q_state)
+        q_state.advance()
+        for m_block in cutlass.range(1, m_blocks, unroll=1):
             pipeline_q.producer_acquire(q_state)
             load_Q(m_block, producer_state=q_state)
             load_LSE(m_block, producer_state=q_state)
@@ -750,22 +801,21 @@ class WanFlashBwdSm90:
         pipeline_do.consumer_wait(c_state, pipeline_do.consumer_try_wait(c_state))
         acc_dP = mma_dov_fn(A_idx=smem_idx, wg_wait=1)  # waits GEMM 1
 
-        # K-tail mask (only when seqlen_k is ragged; m-tail is masked by the
+        # K-tail mask (predicated selects; the m-tail is masked for free by the
         # +inf LSE sentinel written in preprocess)
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
-        if const_expr(True):  # keep the mask structure close to FA4's
-            cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
-            tScS_mn = layout_utils.reshape_acc_to_mn(
-                thr_mma_SdP.partition_C(cS), transpose=True
-            )
-            t0ScS_mn = layout_utils.reshape_acc_to_mn(
-                tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
-            )
-            limit = seqlenk_col_start - tScS_mn[0][0]
-            for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                if t0ScS_mn[0, c][0] >= limit:
-                    for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
-                        acc_S_mn[r, c] = -Float32.inf
+        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+        tScS_mn = layout_utils.reshape_acc_to_mn(
+            thr_mma_SdP.partition_C(cS), transpose=True
+        )
+        t0ScS_mn = layout_utils.reshape_acc_to_mn(
+            tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
+        )
+        limit = seqlenk_col_start - tScS_mn[0][0]
+        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+            oob = t0ScS_mn[0, c][0] >= limit
+            for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
 
         # [Pointwise 1] P = exp2(S*scale_log2 - lse_log2)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -776,10 +826,8 @@ class WanFlashBwdSm90:
                 )
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx])
 
-        # P -> bf16 A-fragments for the dV WGMMA
-        tdVrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
-        tdVrP = cute.make_fragment_like(tdVrP_acc, self.dtype)
-        tdVrP.store(tdVrP_acc.load().to(self.dtype))
+        # P -> bf16 A-fragments for the dV WGMMA (packed cvt)
+        tdVrP = _cvt_bf16_frag(layout_utils.reshape_acc_to_frgA(acc_S))
 
         # [Pointwise 2] dS = P * (dP - D)
         warpgroup.wait_group(0)  # GEMM 2 done
@@ -790,9 +838,7 @@ class WanFlashBwdSm90:
                 acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
 
         # dS -> bf16 fragments (A of the dK WGMMA) and smem (B of the dQ WGMMA)
-        tdKrdS_acc = layout_utils.reshape_acc_to_frgA(acc_dP)
-        tdKrdS = cute.make_fragment_like(tdKrdS_acc, self.dtype)
-        tdKrdS.store(tdKrdS_acc.load().to(self.dtype))
+        tdKrdS = _cvt_bf16_frag(layout_utils.reshape_acc_to_frgA(acc_dP))
         if const_expr(self.PdS_stage == 1):
             # single-buffer dS: previous iteration's dQ GEMM must be done reading
             cute.arch.fence_view_async_shared()
