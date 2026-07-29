@@ -245,6 +245,25 @@ class WanFlashFwdSm90:
 
     # -------------------------------------------------------------- device
     @cute.jit
+    def _fmax_tree(self, x, init_val=None):
+        """4-wide parallel max tree over a TensorSSA row (FA3/FA4 idiom:
+        x.reduce(MAX) emits a serial chain; this gives ILP 4)."""
+        res = cute.make_rmem_tensor(x.shape, Float32)
+        res.store(x)
+        m0, m1, m2, m3 = res[0], res[1], res[2], res[3]
+        for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+            m0 = cute.arch.fmax(m0, res[i + 0])
+            m1 = cute.arch.fmax(m1, res[i + 1])
+            m2 = cute.arch.fmax(m2, res[i + 2])
+            m3 = cute.arch.fmax(m3, res[i + 3])
+        m0 = cute.arch.fmax(m0, m1)
+        m2 = cute.arch.fmax(m2, m3)
+        m0 = cute.arch.fmax(m0, m2)
+        if const_expr(init_val is not None):
+            m0 = cute.arch.fmax(m0, init_val)
+        return m0
+
+    @cute.jit
     def softmax_step(
         self,
         acc_S: cute.Tensor,
@@ -263,7 +282,7 @@ class WanFlashFwdSm90:
         for r in cutlass.range_constexpr(cute.size(row_max)):
             acc_S_row = acc_S_mn[r, None].load()
             if const_expr(is_first):
-                row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, -Float32.inf, 0)
+                row_max_cur = self._fmax_tree(acc_S_row)
                 row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
                 row_max[r] = row_max_cur
                 row_max_scaled = row_max_cur * scale_log2
@@ -274,7 +293,7 @@ class WanFlashFwdSm90:
                 row_scale[r] = 1.0
             else:
                 row_max_prev = row_max[r]
-                row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, row_max_prev, 0)
+                row_max_cur = self._fmax_tree(acc_S_row, init_val=row_max_prev)
                 row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
                 acc_scale_log2 = (row_max_prev - row_max_cur) * scale_log2  # <= 0
                 acc_scale = cute.math.exp2(acc_scale_log2, fastmath=True)
