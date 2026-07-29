@@ -45,6 +45,8 @@ LN_2 = math.log(2.0)
 BAR_EPILOGUE = 1
 BAR_WG_SCHED1 = 2  # consumer-warpgroup ping-pong (intra_wg_overlap builds)
 BAR_WG_SCHED2 = 3
+BAR_O_FREE = 4  # persistent scheduler: sO drained by TMA, safe to overwrite
+SM_COUNT = int(__import__("os").environ.get("WAN_FLASH_SM_COUNT", "132"))  # H100 SXM
 
 
 class WanFlashFwdSm90:
@@ -57,7 +59,9 @@ class WanFlashFwdSm90:
         rescale_skip_threshold: float = 0.0,
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
+        scheduler: str = "single",
     ):
+        assert scheduler in ("single", "persistent")
         assert head_dim % 16 == 0 and head_dim <= 256
         assert tile_m % 64 == 0
         assert tile_n % 8 == 0 and tile_n <= 256, "GMMA N must be mult of 8, <= 256"
@@ -80,14 +84,29 @@ class WanFlashFwdSm90:
         ]
         self.scale_log2 = (1.0 / math.sqrt(head_dim)) * LOG2_E
         self.use_scheduler_barrier = self.num_wg_mma == 2 and self.intra_wg_overlap
+        self.persistent = scheduler == "persistent"
 
     # ------------------------------------------------------------- helpers
-    def _make_storage(self, sQ_layout, sK_layout, sV_layout):
+    def _make_storage(self, sQ_layout, sK_layout, sV_layout, sO_layout):
         dtype = self.dtype
         stages = self.num_stages
         Aligned = lambda l: cute.struct.Align[
             cute.struct.MemRange[dtype, cute.cosize(l)], 1024
         ]
+
+        if self.persistent:
+            # separate sO: next tile's Q load must not race the O TMA drain
+            @cute.struct
+            class SharedStorageP:
+                mbar_Q: cute.struct.MemRange[cutlass.Int64, 1 * 2]
+                mbar_K: cute.struct.MemRange[cutlass.Int64, stages * 2]
+                mbar_V: cute.struct.MemRange[cutlass.Int64, stages * 2]
+                sV: Aligned(sV_layout)
+                sQ: Aligned(sQ_layout)
+                sK: Aligned(sK_layout)
+                sO: Aligned(sO_layout)
+
+            return SharedStorageP
 
         @cute.struct
         class SharedStorage:
@@ -201,10 +220,14 @@ class WanFlashFwdSm90:
             op_s2g, mO, sO_layout, (self.tile_m, self.head_dim)
         )
 
-        SharedStorage = self._make_storage(sQ_layout, sK_layout, sV_layout)
+        SharedStorage = self._make_storage(sQ_layout, sK_layout, sV_layout, sO_layout)
 
         m_blocks = cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m)
-        grid = (m_blocks, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
+        if const_expr(self.persistent):
+            total_tiles = m_blocks * cute.size(mQ.shape[2]) * cute.size(mQ.shape[3])
+            grid = (min(total_tiles, SM_COUNT), 1, 1)
+        else:
+            grid = (m_blocks, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
         self.kernel(
             tma_tensor_Q, tma_tensor_K, tma_tensor_V, tma_tensor_O, mLSE,
             tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O,
@@ -412,8 +435,14 @@ class WanFlashFwdSm90:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sVt = layout_utils.transpose_view(sV)
-        # O reuses sQ's smem for the epilogue
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        if const_expr(self.persistent):
+            # dedicated sO: next tile's Q load overlaps this tile's O drain
+            sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
+        else:
+            # O reuses sQ's smem for the epilogue
+            sO = storage.sQ.get_tensor(
+                sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype
+            )
 
         # zero-fill V pad rows (tile_n_pad > tile_n only): the pad rows of
         # each stage are the trailing whole swizzle atoms => a contiguous
@@ -433,11 +462,22 @@ class WanFlashFwdSm90:
                     pad[i] = self.dtype(0.0)
             cute.arch.fence_view_async_shared()
 
-        m_block, head, batch = cute.arch.block_idx()
         seqlen_q = cute.size(mQ.shape[0])
         seqlen_k = cute.size(mK.shape[0])
         n_blocks = cute.ceil_div(seqlen_k, self.tile_n)
         n_tail = seqlen_k - (n_blocks - 1) * self.tile_n  # in (0, tile_n]
+        m_blocks = cute.ceil_div(seqlen_q, self.tile_m)
+        num_heads = cute.size(mQ.shape[2])
+
+        # per-CTA tile schedule: "single" = one tile from blockIdx;
+        # "persistent" = strided walk over (batch, head, m_block) tiles.
+        if const_expr(self.persistent):
+            bidx, _, _ = cute.arch.block_idx()
+            total_tiles = m_blocks * num_heads * cute.size(mQ.shape[3])
+            grid_x = min(total_tiles, SM_COUNT)
+            num_my_tiles = (total_tiles - bidx + grid_x - 1) // grid_x
+        else:
+            num_my_tiles = 1
 
         pipeline_init_wait(cluster_shape_mn=(1, 1))
 
@@ -445,63 +485,73 @@ class WanFlashFwdSm90:
             # ======================= PRODUCER =======================
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             if warp_idx == 0:
-                mQ_cur = mQ[None, None, head, batch]
-                mK_cur = mK[None, None, head, batch]
-                mV_cur = mV[None, None, head, batch]
-                gQ = cute.local_tile(mQ_cur, (self.tile_m, self.head_dim), (m_block, 0))
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.head_dim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.head_dim), (None, 0))
-                load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
-                )
-                load_K, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), gK, sK
-                )
-                load_V, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_V, 0, cute.make_layout(1), gV, sV
-                )
-                load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
-                load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
-
                 q_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, 1
                 )
-                pipeline_q.producer_acquire(q_state)
-                load_Q(tma_bar_ptr=pipeline_q.producer_get_barrier(q_state))
-
                 kv_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_stages
                 )
-                if const_expr(self.intra_wg_overlap):
-                    # K runs one block ahead of V, matching the consumer's
-                    # QK(i+1)-before-PV(i) order.
-                    pipeline_k.producer_acquire(kv_state)
-                    load_K(src_idx=n_blocks - 1, producer_state=kv_state)
-                    pipeline_k.producer_commit(kv_state)
-                    for i in cutlass.range(n_blocks - 1, unroll=1):
-                        n_block_prev = n_blocks - 1 - i
-                        kv_state_prev = kv_state.clone()
-                        kv_state.advance()
+                for tile in cutlass.range(num_my_tiles, unroll=1):
+                    if const_expr(self.persistent):
+                        tile_id = bidx + tile * grid_x
+                        batch = tile_id // (m_blocks * num_heads)
+                        rest = tile_id % (m_blocks * num_heads)
+                        head = rest // m_blocks
+                        m_block = rest % m_blocks
+                    else:
+                        m_block, head, batch = cute.arch.block_idx()
+                    mQ_cur = mQ[None, None, head, batch]
+                    mK_cur = mK[None, None, head, batch]
+                    mV_cur = mV[None, None, head, batch]
+                    gQ = cute.local_tile(mQ_cur, (self.tile_m, self.head_dim), (m_block, 0))
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.head_dim), (None, 0))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.head_dim), (None, 0))
+                    load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
+                    )
+                    load_K, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_K, 0, cute.make_layout(1), gK, sK
+                    )
+                    load_V, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_V, 0, cute.make_layout(1), gV, sV
+                    )
+                    load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
+                    load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
+
+                    pipeline_q.producer_acquire(q_state)
+                    load_Q(tma_bar_ptr=pipeline_q.producer_get_barrier(q_state))
+                    q_state.advance()
+
+                    if const_expr(self.intra_wg_overlap):
+                        # K runs one block ahead of V, matching the consumer's
+                        # QK(i+1)-before-PV(i) order.
                         pipeline_k.producer_acquire(kv_state)
-                        load_K(src_idx=n_block_prev - 1, producer_state=kv_state)
+                        load_K(src_idx=n_blocks - 1, producer_state=kv_state)
                         pipeline_k.producer_commit(kv_state)
-                        pipeline_v.producer_acquire(kv_state_prev)
-                        load_V(src_idx=n_block_prev, producer_state=kv_state_prev)
-                        pipeline_v.producer_commit(kv_state_prev)
-                    pipeline_v.producer_acquire(kv_state)
-                    load_V(src_idx=0, producer_state=kv_state)
-                    pipeline_v.producer_commit(kv_state)
-                    kv_state.advance()
-                else:
-                    for i in cutlass.range(n_blocks, unroll=1):
-                        n_block = n_blocks - 1 - i
-                        pipeline_k.producer_acquire(kv_state)
-                        load_K(src_idx=n_block, producer_state=kv_state)
-                        pipeline_k.producer_commit(kv_state)
+                        for i in cutlass.range(n_blocks - 1, unroll=1):
+                            n_block_prev = n_blocks - 1 - i
+                            kv_state_prev = kv_state.clone()
+                            kv_state.advance()
+                            pipeline_k.producer_acquire(kv_state)
+                            load_K(src_idx=n_block_prev - 1, producer_state=kv_state)
+                            pipeline_k.producer_commit(kv_state)
+                            pipeline_v.producer_acquire(kv_state_prev)
+                            load_V(src_idx=n_block_prev, producer_state=kv_state_prev)
+                            pipeline_v.producer_commit(kv_state_prev)
                         pipeline_v.producer_acquire(kv_state)
-                        load_V(src_idx=n_block, producer_state=kv_state)
+                        load_V(src_idx=0, producer_state=kv_state)
                         pipeline_v.producer_commit(kv_state)
                         kv_state.advance()
+                    else:
+                        for i in cutlass.range(n_blocks, unroll=1):
+                            n_block = n_blocks - 1 - i
+                            pipeline_k.producer_acquire(kv_state)
+                            load_K(src_idx=n_block, producer_state=kv_state)
+                            pipeline_k.producer_commit(kv_state)
+                            pipeline_v.producer_acquire(kv_state)
+                            load_V(src_idx=n_block, producer_state=kv_state)
+                            pipeline_v.producer_commit(kv_state)
+                            kv_state.advance()
                 pipeline_v.producer_tail(kv_state)
         else:
             # ======================= CONSUMER =======================
@@ -535,11 +585,61 @@ class WanFlashFwdSm90:
             )
             mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
+            st_atom_O = cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                self.dtype,
+            )
+            thr_copy_O = cute.make_tiled_copy_C(st_atom_O, tiled_mma_pv).get_slice(tidx)
+            cO = cute.make_identity_tensor((self.tile_m, self.head_dim))
+            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
+            t0accOcO = layout_utils.reshape_acc_to_mn(
+                tiled_mma_pv.get_slice(0).partition_C(cO)
+            )
+
             q_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             kv_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages
             )
             self.mma_init(wg_idx)
+            warp_idx_c = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if const_expr(self.persistent):
+                # prime "sO free": there is no O TMA in flight initially
+                if warp_idx_c == 4:
+                    cute.arch.barrier_arrive(
+                        barrier_id=BAR_O_FREE,
+                        number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
+                    )
+
+            for tile in cutlass.range(num_my_tiles, unroll=1):
+                if const_expr(self.persistent):
+                    tile_id = bidx + tile * grid_x
+                    batch = tile_id // (m_blocks * num_heads)
+                    rest = tile_id % (m_blocks * num_heads)
+                    head = rest // m_blocks
+                    m_block = rest % m_blocks
+                else:
+                    m_block, head, batch = cute.arch.block_idx()
+                self._consumer_tile(
+                    mO, mLSE, sO, sQ, tiled_mma_qk, tiled_mma_pv, thr_mma_qk,
+                    thr_mma_pv, mma_qk_fn, mma_pv_fn, acc_O, tOrP,
+                    row_max, row_sum, row_scale, num_rows,
+                    pipeline_q, pipeline_k, pipeline_v, q_state, kv_state,
+                    tma_atom_O, st_atom_O, thr_copy_O, taccOcO, t0accOcO,
+                    tidx, wg_idx, warp_idx_c, m_block, head, batch,
+                    seqlen_q, seqlen_k, n_blocks, n_tail,
+                )
+
+    @cute.jit
+    def _consumer_tile(
+        self, mO, mLSE, sO, sQ, tiled_mma_qk, tiled_mma_pv, thr_mma_qk,
+        thr_mma_pv, mma_qk_fn, mma_pv_fn, acc_O, tOrP,
+        row_max, row_sum, row_scale, num_rows: cutlass.Constexpr[int],
+        pipeline_q, pipeline_k, pipeline_v, q_state, kv_state,
+        tma_atom_O, st_atom_O, thr_copy_O, taccOcO, t0accOcO,
+        tidx, wg_idx, warp_idx_c, m_block, head, batch,
+        seqlen_q: cutlass.Constexpr[int], seqlen_k: cutlass.Constexpr[int],
+        n_blocks: cutlass.Constexpr[int], n_tail: cutlass.Constexpr[int],
+    ):
             pipeline_q.consumer_wait(q_state, pipeline_q.consumer_try_wait(q_state))
 
             if const_expr(self.intra_wg_overlap):
@@ -578,10 +678,16 @@ class WanFlashFwdSm90:
                     self.convert_P(acc_S, tOrP)
                     self.rescale_O(acc_O, row_scale)
 
+                # all QK gemms done (wait_group above): release Q for the
+                # producer's next-tile load
+                if const_expr(self.persistent):
+                    pipeline_q.consumer_release(q_state)
+                    q_state.advance()
                 # trailing PV of the last consumed block
                 pipeline_v.consumer_wait(kv_state, pipeline_v.consumer_try_wait(kv_state))
                 mma_pv_fn(zero_init=False, B_idx=kv_state.index, wg_wait=0)
                 pipeline_v.consumer_release(kv_state)
+                kv_state.advance()
             else:
                 # ================= simple non-overlap loop =================
                 # ---- peeled first block: the ragged KV tail (masked), is_first
@@ -609,6 +715,9 @@ class WanFlashFwdSm90:
                     mma_pv_fn(zero_init=False, B_idx=kv_state.index, wg_wait=0)
                     pipeline_v.consumer_release(kv_state)
                     kv_state.advance()
+                if const_expr(self.persistent):
+                    pipeline_q.consumer_release(q_state)
+                    q_state.advance()
 
             # ---- finalize: quad-reduce row_sum, compute LSE + 1/sum scale
             for r in cutlass.range_constexpr(num_rows):
@@ -625,15 +734,18 @@ class WanFlashFwdSm90:
             # ---- epilogue: O -> smem (StMatrix) -> gmem (TMA); LSE direct
             rO = cute.make_fragment_like(acc_O, self.dtype)
             rO.store(acc_O.load().to(self.dtype))
-            # both consumer WGs must be done reading sQ (sO aliases it)
-            cute.arch.barrier(
-                barrier_id=BAR_EPILOGUE, number_of_threads=self.num_mma_threads
-            )
-            st_atom_O = cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
-                self.dtype,
-            )
-            thr_copy_O = cute.make_tiled_copy_C(st_atom_O, tiled_mma_pv).get_slice(tidx)
+            if const_expr(self.persistent):
+                # wait until the previous tile's O TMA drained sO (also joins
+                # the two consumer WGs, keeping the tile step in lock-step)
+                cute.arch.barrier(
+                    barrier_id=BAR_O_FREE,
+                    number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
+                )
+            else:
+                # both consumer WGs must be done reading sQ (sO aliases it)
+                cute.arch.barrier(
+                    barrier_id=BAR_EPILOGUE, number_of_threads=self.num_mma_threads
+                )
             cute.copy(st_atom_O, thr_copy_O.retile(rO), thr_copy_O.partition_D(sO))
 
             # LSE store with m-tail predication (natural log, fp32)
@@ -643,12 +755,7 @@ class WanFlashFwdSm90:
                 gLSE.iterator,
                 cute.append(gLSE.layout, cute.make_layout(self.head_dim, stride=0)),
             )
-            cO = cute.make_identity_tensor((self.tile_m, self.head_dim))
             taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gLSE_expanded))
-            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
-            t0accOcO = layout_utils.reshape_acc_to_mn(
-                tiled_mma_pv.get_slice(0).partition_C(cO)
-            )
             if taccOcO[0][1] == 0:  # lanes owning column 0
                 row_limit = seqlen_q - m_block * self.tile_m - taccOcO[0][0]
                 for r in cutlass.range_constexpr(num_rows):
@@ -665,7 +772,6 @@ class WanFlashFwdSm90:
             store_O, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_O, 0, cute.make_layout(1), sO, gO, single_stage=True
             )
-            warp_idx_c = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             if warp_idx_c == 4:
                 cute.arch.barrier(
                     barrier_id=BAR_EPILOGUE,
@@ -674,3 +780,8 @@ class WanFlashFwdSm90:
                 store_O()
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if const_expr(self.persistent):
+                    cute.arch.barrier_arrive(
+                        barrier_id=BAR_O_FREE,
+                        number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
+                    )

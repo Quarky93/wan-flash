@@ -52,4 +52,5 @@ if __name__ == "__main__":
         feat["tile_n"] = args.tile_n
     if args.rescale_skip is not None:
         feat["rescale_skip_threshold"] = args.rescale_skip
+    # (feature dict keys must match wan_flash.features.FwdFeatures fields)
     run(h=args.h, sq=args.sq, skv=args.skv, **feat)

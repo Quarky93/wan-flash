@@ -47,6 +47,7 @@ def wan_flash_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
             rescale_skip_threshold=f.rescale_skip_threshold,
             intra_wg_overlap=f.intra_wg_overlap,
             mma_pv_is_rs=f.mma_pv_is_rs,
+            scheduler=f.scheduler,
         )
         _compile_cache[key] = cute.compile(kernel, *cargs, stream)
     _compile_cache[key](*cargs, stream)
