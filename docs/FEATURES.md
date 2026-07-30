@@ -81,38 +81,42 @@ in the git history of this file.
 
 ---
 
-# BACKWARD (wan_flash/bwd_sm90.py, 2026-07-29)
+# BACKWARD (wan_flash/bwd_sm90.py, 2026-07-30)
 
 Three-kernel chain per docs/BWD_STUDY.md: preprocess (D=rowsum(O*dO),
 lse*log2e with +inf pad sentinel, dQaccum zero) -> main (dK/dV-stationary,
 384 threads: producer warp 0 TMA, warp 1 dQ `cp.reduce.async.bulk.add.f32`,
 2 MMA WGs x 5 WGMMAs; tile 80x128, stages 2/2/2, SdP_swapAB + dQ_swapAB,
-AtomLayout(1,2,1) => dK/dV RS from registers) -> postprocess (dQaccum fp32
-fragment-order -> *scale -> bf16). Inputs (q,k,v,o,lse,do), lse NATURAL log
-(b,h,s) fp32 = the FA3/FA4 contract (drop-in for FA3-fwd hybrids, tested).
+AtomLayout(1,2,1) => dK/dV RS from registers; **cluster_n=2 Q/dO TMA
+multicast at self shapes**) -> postprocess (dQaccum fp32 fragment-order ->
+*scale -> bf16). Inputs (q,k,v,o,lse,do), lse NATURAL log (b,h,s) fp32 =
+the FA3/FA4 contract (drop-in for FA3-fwd hybrids, tested).
 
 One clean run, `bench.bench --impl fa3 fa4 wan --shapes all --modes bwd`
-(2026-07-29, final defaults; bwd TFLOP/s = 2.5 * 4*b*h*sq*skv*d / t;
-identical o/lse/do from FA3's fwd fed to all three):
+(2026-07-30, final defaults incl. cluster_n=2; bwd TFLOP/s =
+2.5 * 4*b*h*sq*skv*d / t; identical o/lse/do from FA3's fwd fed to all three):
 
 | shape | FA3 raw bwd | FA4 raw bwd | wan-flash | vs FA3 | vs FA4 |
 |---|---|---|---|---|---|
-| self h12 S=32760  | 27.512 ms / 599.2 | 26.644 ms / 618.7 | 26.687 ms / 617.7 | **1.031x** | 0.998x |
-| self h12 S=75600  | 144.050 ms / 609.4 | 139.518 ms / 629.2 | 138.986 ms / 631.6 | **1.036x** | **1.004x** |
-| self h40 S=32760  | 90.670 ms / 606.0 | 87.963 ms / 624.7 | 88.390 ms / 621.7 | **1.026x** | 0.995x |
-| self h40 S=75600  | 491.066 ms / 595.9 | 467.720 ms / 625.6 | 476.565 ms / 614.0 | **1.030x** | 0.981x |
-| cross h12 32760x512 | 1.179 ms / 218.5 | 1.148 ms / 224.4 | 0.714 ms / 360.8 | **1.651x** | **1.608x** |
-| cross h12 75600x512 | 2.700 ms / 220.2 | 2.625 ms / 226.5 | 1.591 ms / 373.8 | **1.698x** | **1.650x** |
-| cross h40 32760x512 | 2.852 ms / 301.1 | 2.821 ms / 304.4 | 2.294 ms / 374.4 | **1.243x** | **1.230x** |
-| cross h40 75600x512 | 6.555 ms / 302.3 | 6.488 ms / 305.5 | 5.197 ms / 381.4 | **1.261x** | **1.248x** |
+| self h12 S=32760  | 27.506 ms / 599.3 | 26.715 ms / 617.1 | 26.491 ms / 622.3 | **1.038x** | **1.008x** |
+| self h12 S=75600  | 144.326 ms / 608.3 | 139.236 ms / 630.5 | 136.792 ms / 641.8 | **1.055x** | **1.018x** |
+| self h40 S=32760  | 90.851 ms / 604.8 | 88.084 ms / 623.8 | 88.316 ms / 622.2 | **1.029x** | 0.997x |
+| self h40 S=75600  | 490.265 ms / 596.9 | 466.594 ms / 627.2 | 460.322 ms / 635.7 | **1.065x** | **1.014x** |
+| cross h12 32760x512 | 1.184 ms / 217.6 | 1.154 ms / 223.3 | 0.716 ms / 359.9 | **1.654x** | **1.612x** |
+| cross h12 75600x512 | 2.699 ms / 220.3 | 2.625 ms / 226.5 | 1.581 ms / 376.0 | **1.707x** | **1.660x** |
+| cross h40 32760x512 | 2.850 ms / 301.3 | 2.821 ms / 304.4 | 2.294 ms / 374.4 | **1.242x** | **1.230x** |
+| cross h40 75600x512 | 6.550 ms / 302.6 | 6.485 ms / 305.6 | 5.211 ms / 380.3 | **1.257x** | **1.245x** |
 
 Run-to-run noise ~±0.5-1% on self shapes; bench order is (fa3, fa4, wan)
-per shape, wan measured last (warmest GPU).
+per shape, wan measured last (warmest GPU). Steady-state alternating
+medians (fa4 vs wan, 5 s pre-warm) agree: 1.008/1.014/1.004/1.019x FA4 on
+the four self shapes. h40@32760's 0.997x here is within that noise band.
 
 ## Verdict table (defaults in wan_flash/features.py BwdFeatures)
 
 | feature | default | verdict | numbers (main kernel, h12 S=32760 unless noted) |
 |---|---|---|---|
+| `cluster_n` | **2** (self; forced 1 under split-M) | KEEP. 2-CTA cluster over adjacent n-blocks of one head; Q/dO ride TMA multicast (each CTA loads half the box). The dK/dV-stationary loop's dominant L2 traffic is every CTA of a head re-reading the whole Q/dO stream (~3.7 TB/s at h40/75600) — halving it buys +57 MHz at the 698 W wall and closes (flips) the FA4 gap. Stats (LSE/dPsum, 320 B) stay per-CTA loads. Odd n_blocks: phantom pad CTA + `producer_tail` on both pipelines (see notes). | h40 75600: 476.7 -> 456.5 ms sustained (1415 -> 1472 MHz); vs FA4 steady medians 0.973x -> **1.019x**. All self shapes win: 1.008/1.014/1.004/1.019x FA4 |
 | packed `cvt.rn.bf16x2.f32` for P/dS | **on** | KEEP. TensorSSA `.to(bf16)` emits one scalar cvt per element at our 128x80 accum shape (FA4's known trap, cookbook 4.3). Biggest single win. | 29.38 -> 24.06 ms main kernel (+18%); wall 31.5 -> 27.0 ms |
 | PDL chain (pre -> main) | **on** | KEEP. `use_pdl=True` on preprocess+main; preprocess waits before O/dO, signals after loads; main's producer waits between load_Q(0) and the first load_LSE, so K/Q(0) TMA overlaps the preprocess tail. | ~0.3-0.9 ms of launch overlap per call |
 | K-tail mask form | select, every iter | KEEP FA4's unconditional predicated selects. A runtime `if is_tail_cta:` skip-branch around them measured 5% SLOWER (scf.if region blocks scheduling). Compiled out when skv % 128 == 0 (cross 512). | branch: 27.08 ms vs select: 25.82 ms wall |
@@ -135,17 +139,34 @@ per shape, wan measured last (warmest GPU).
 - Alt configs re-verified vs oracle: tile_m=64, num_stages=1, batch=2,
   nsplit auto>1 on cross shapes.
 
-## Known gap / notes
+## The h40@75600 gap: analysis + fix (2026-07-30 session)
 
-- **self h40 S=75600 is ~2% behind FA4 wall (3.7% on the main kernel,
-  469.8 vs 452.9 ms interleaved) while ~3% ahead of FA3.** The gap appears
-  only at that shape and grows with h at fixed S=75600 (h12 +0.4%, h20 +4.1%,
-  h30 +6.3%, h40 +9.7% before the fixes below); power sampling showed our
-  kernel drawing ~+40-60W at similar clocks there, pointing at an L2/drift
-  interaction of the dQaccum reduce traffic at high wave counts rather than
-  per-iteration instruction count. The KV tx piggyback + dropping the
-  mask-skip branch recovered ~2/3 of the original gap; the remainder ships
-  as-is.
+The previous session's "~2% behind FA4 at self h40/75600 only" gap was run
+down and closed (0.973x -> 1.019x FA4 steady-state). Findings, with numbers:
+
+- FA4's main kernel is structurally identical (verified line-by-line: same
+  80x128 config, same SingleTileScheduler grid, same dQaccum store-warp
+  loop, same 240/240/24 regs, no L2 swizzle in their non-deterministic
+  path) — the gap was never instruction count.
+- Power sampling: both pegged at 698-699 W; we clocked 42 MHz LOWER
+  (1416 vs 1458) = more memory-system energy per unit work. Disabling our
+  dQ bulk-add flush (diagnostic build): 476 -> 433 ms and +127 MHz — the
+  dQaccum RMW stream is the power hog, but it is traffic FA4 also pays.
+- Traffic accounting at h40/75600: Q/dO L2 reads ~3.7 TB/s (every n-CTA of
+  a head re-reads the whole 77 MB Q/dO stream) + dQaccum L2 RMW ~1.9 TB/s
+  — the kernel rides the L2-bandwidth/power ceiling. **Fix: halve the Q/dO
+  stream with cluster_n=2 TMA multicast** (see verdict table): 476.7 ->
+  456.5 ms, faster than FA4 at 3 of 4 self shapes and within noise at the
+  4th.
+- Losing levers, measured and reverted:
+  - m-sweep zigzag (odd n-CTAs descend m, halves dQaccum line contention
+    but de-aligns the shared Q/dO window): 476.4 -> 491.8 ms. Sharing >
+    contention, decisively.
+  - `L2::cache_hint` evict_last on the dQaccum bulk-adds (the hint quack
+    ships commented out): 476.4 -> 494.0 ms. Protecting RMW lines starves
+    the (2x bigger) Q/dO stream.
+  - PDL off (aligned first wave): 476.5 ms, neutral — launch-skew drift is
+    not the mechanism.
 - The dQaccum gmem element order is the dQ WGMMA accumulator fragment order;
   main kernel and postprocess must be built with the same (tile_m, num_wg,
   AtomLayoutMdQ, dQ_swapAB) — enforced by constructing both from the same
@@ -154,3 +175,17 @@ per shape, wan measured last (warmest GPU).
 - Loop-carry footgun (same as fwd): consumer pipeline state is returned and
   reassigned from `_mma_m_block`; `dKV_accumulate` is reassigned directly in
   the range body. Neither is mutated through `self`.
+- **Cluster exit-safety rule (cost a day-of-flaky-719s to learn):** with
+  multicast pipelines, `consumer_release` arrives on the empty mbarriers of
+  BOTH CTAs of the pair. A CTA must therefore stay resident until its peer's
+  final arrives have LANDED — `producer_tail` on every multicast pipeline
+  before the producer warp exits is mandatory (its docstring even says so:
+  "avoid dangling mbarrier arrive signals after kernel exit"). Without it,
+  the phantom pad CTA (shorter epilogue: no dK/dV TMA stores) exits early
+  and the peer's arrive faults the cluster: CUDA 719, no memcheck findings,
+  probability scaling with pair count (h2/h12 usually pass, h40 reliably
+  faults). The fwd kernel was implicitly protected by its pre-existing V
+  producer_tail; it now tails K too under cluster.
+- `tests/test_bwd.py::test_bwd_alt_configs` pins the cluster and no-cluster
+  paths at nsplit=1 battery sizes (1152 = odd n_blocks = phantom CTA);
+  the slow true-shape tests exercise the phantom at 75600 (591 n-blocks).

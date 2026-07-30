@@ -57,12 +57,17 @@ class BwdFeatures:
                 self shapes; picked for >=95% wave efficiency when the base
                 grid underfills the GPU). NOTE: nsplit > 1 makes dk/dv
                 nondeterministic (atomic add order), like dq already is.
+    cluster_n   2 = 2-CTA cluster over adjacent n-blocks of a head with Q/dO
+                TMA multicast (halves the dominant L2 read stream of the
+                dK/dV-stationary loop). Self-attn shapes only (forced to 1
+                when the auto/explicit nsplit > 1).
     """
 
     tile_m: int = 80
     tile_n: int = 128
     num_stages: int = 2
     nsplit: int = 0
+    cluster_n: int = 2   # Q/dO TMA multicast pairs: beats FA4 at all self shapes
 
 
 _current = FwdFeatures()

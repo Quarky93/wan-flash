@@ -675,6 +675,12 @@ class WanFlashFwdSm90:
                             load_V(src_idx=n_block, producer_state=kv_state)
                             pipeline_v.producer_commit(kv_state)
                             kv_state.advance()
+                if const_expr(self.cluster_m > 1):
+                    # peer consumers arrive on OUR K empty barriers too; wait
+                    # for those arrives before this CTA may exit (V tail alone
+                    # covers V; K's last arrives are a separate transaction)
+                    k_state = kv_state.clone()
+                    pipeline_k.producer_tail(k_state)
                 pipeline_v.producer_tail(kv_state)
         else:
             # ======================= CONSUMER =======================

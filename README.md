@@ -61,23 +61,29 @@ scheduler + packed bf16x2 converts + rescale-skip 8.0 + intra-WG overlap,
 | cross h12 S=75600×512 | 547.9 TFLOP/s | **1.022x** | **1.200x** |
 | cross h40 S=75600×512 | 544.3 TFLOP/s | **1.039x** | **1.203x** |
 
-**Backward: done and green.** `tests/test_bwd.py` passes (fast battery, FA3-fwd
-hybrid, autograd chain, true shapes behind `WAN_FLASH_SLOW_TESTS=1`); dq/dk/dv
-vs the chunked-fp32 oracle sit at the bf16 floor (rel_l2 ≈ 2.3e-3, gated at
-≤ 2x FA3's raw backward on identical inputs). Three-kernel chain
-(preprocess → dK/dV-stationary warp-specialized main → dQ convert), FA4's
-hd128 non-causal config (80×128, SdP/dQ swapAB, register-resident dK/dV),
-packed bf16x2 converts, PDL, and a split-M schedule that fixes the
-small-KV cross-attention occupancy pathology FA3/FA4 both have.
+**Backward: done and green — faster than FA3 everywhere, ahead of or at
+parity with FA4 at every Wan shape.** `tests/test_bwd.py` passes (fast
+battery + cluster alt-configs, FA3-fwd hybrid, autograd chain, true shapes
+behind `WAN_FLASH_SLOW_TESTS=1`); dq/dk/dv vs the chunked-fp32 oracle sit at
+the bf16 floor (rel_l2 ≈ 2.3e-3, gated at ≤ 2x FA3's raw backward on
+identical inputs). Three-kernel chain (preprocess → dK/dV-stationary
+warp-specialized main → dQ convert), FA4's hd128 non-causal config (80×128,
+SdP/dQ swapAB, register-resident dK/dV), packed bf16x2 converts, PDL, a
+2-CTA cluster with Q/dO TMA multicast (halves the dominant L2 stream of the
+dK/dV-stationary loop — neither FA3 nor FA4 does this in their sm90 bwd),
+and a split-M schedule that fixes the small-KV cross-attention occupancy
+pathology FA3/FA4 both have.
 
 H100 SXM, raw backward (identical o/lse/do fed to all three):
 
 | shape | wan-flash | vs FA3 | vs FA4 |
 |---|---|---|---|
-| self h12 S=32760 | 617.7 TFLOP/s | 1.031x | 0.998x |
-| self h40 S=75600 | 614.0 TFLOP/s | 1.030x | 0.981x |
-| cross h12 S=75600×512 | 373.8 TFLOP/s | **1.698x** | **1.650x** |
-| cross h40 S=75600×512 | 381.4 TFLOP/s | **1.261x** | **1.248x** |
+| self h12 S=32760 | 622.3 TFLOP/s | **1.038x** | **1.008x** |
+| self h12 S=75600 | 641.8 TFLOP/s | **1.055x** | **1.018x** |
+| self h40 S=32760 | 622.2 TFLOP/s | **1.029x** | 0.997x |
+| self h40 S=75600 | 635.7 TFLOP/s | **1.065x** | **1.014x** |
+| cross h12 S=75600×512 | 376.0 TFLOP/s | **1.707x** | **1.660x** |
+| cross h40 S=75600×512 | 380.3 TFLOP/s | **1.257x** | **1.245x** |
 
 Full 8-shape tables (fwd + bwd) and per-feature verdicts: `docs/FEATURES.md`.
 

@@ -13,6 +13,12 @@ follows):
      warp 1 = dQ gmem accumulation (cp.reduce.async.bulk.add.f32, the FA3/FA4
      nondeterministic default); warps 4-11 = 2 MMA warpgroups running the five
      WGMMAs (S=QK^T, dP=dO V^T, dV+=P^T dO, dQ=dS K, dK+=dS^T Q).
+     cluster_n=2 (default at self shapes): adjacent n-blocks of a head form a
+     2-CTA cluster sharing the Q/dO streams via TMA multicast -- the dominant
+     L2 read traffic of the dK/dV-stationary loop halves. Odd n_blocks pads
+     the grid with a phantom CTA (full compute on the peer's n-block, all
+     gmem outputs suppressed); producer_tail on both pipelines keeps a CTA
+     resident until the peer's final multicast empty-arrives have landed.
      Config (FA4 hd128 non-causal): tile_m=80, tile_n=128, stages 2/2/2,
      SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=(tile_m%64!=0),
      AtomLayout(MSdP,NdKV,MdQ)=(1,2,1) => mma_dkv_is_rs=True (P/dS feed the
@@ -240,6 +246,7 @@ class WanFlashBwdSm90:
         tile_n: int = 128,
         num_stages: int = 2,
         nsplit: int = 1,
+        cluster_n: int = 1,
     ):
         self.num_wg_mma = 2
         assert head_dim % 16 == 0 and head_dim <= 128
@@ -247,6 +254,12 @@ class WanFlashBwdSm90:
         assert tile_m % 16 == 0, "dK/dV contraction (K = tile_m) tiles by k16"
         assert num_stages in (1, 2)
         assert nsplit >= 1
+        assert cluster_n in (1, 2)
+        if cluster_n > 1:
+            # cluster pairs adjacent n-blocks of a head: Q/dO/(stats) streams
+            # are shared via TMA multicast. Not combined with split-M.
+            assert nsplit == 1, "cluster_n requires nsplit == 1"
+        self.cluster_n = cluster_n
         self.head_dim = head_dim
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -406,12 +419,21 @@ class WanFlashBwdSm90:
         tma_bytes_dQ = self.tile_m * self.head_dim * Float32.width // 8 // self.num_wg_dQ
 
         op_g2s = cpasync.CopyBulkTensorTileG2SOp()
+        # Q/dO multicast across the cluster-n pair (adjacent n-blocks of one
+        # head stream identical Q/dO; each CTA loads half the box)
+        op_g2s_qdo = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if const_expr(self.cluster_n > 1)
+            else op_g2s
+        )
         op_s2g = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
-            op_g2s, mQ, cute.select(sQ_l, mode=[0, 1]), (self.tile_m, self.head_dim)
+            op_g2s_qdo, mQ, cute.select(sQ_l, mode=[0, 1]),
+            (self.tile_m, self.head_dim), self.cluster_n,
         )
         tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(
-            op_g2s, mdO, cute.select(sdO_l, mode=[0, 1]), (self.tile_m, self.head_dim)
+            op_g2s_qdo, mdO, cute.select(sdO_l, mode=[0, 1]),
+            (self.tile_m, self.head_dim), self.cluster_n,
         )
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             op_g2s, mK, cute.select(sK_l, mode=[0, 1]), (self.tile_n, self.head_dim)
@@ -446,8 +468,15 @@ class WanFlashBwdSm90:
         SharedStorage = self._make_storage(sQ_l, sdO_l, sK_l, sV_l, sdS_l, sdQaccum_l)
 
         n_blocks = cute.ceil_div(cute.size(mK.shape[0]), self.tile_n)
-        grid = (n_blocks * self.nsplit, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
-        self.kernel(
+        # grid padded to whole clusters; the pad CTA recomputes its peer's
+        # n-block and skips all gmem outputs (dQ flush, dK/dV store)
+        n_units = cute.ceil_div(n_blocks, self.cluster_n)
+        grid = (
+            n_units * self.cluster_n * self.nsplit,
+            cute.size(mQ.shape[2]),
+            cute.size(mQ.shape[3]),
+        )
+        kernel = self.kernel(
             tma_tensor_Q, tma_tensor_K, tma_tensor_V, tma_tensor_dO,
             tma_tensor_dK, tma_tensor_dV,
             mLSElog2, mdPsum, mdQaccum,
@@ -458,13 +487,24 @@ class WanFlashBwdSm90:
             tma_bytes["Q"], tma_bytes["K"], tma_bytes["V"], tma_bytes["dO"],
             tma_bytes_stat, tma_bytes_dQ,
             SharedStorage,
-        ).launch(
-            grid=grid,
-            block=[self.num_threads, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=1,
-            use_pdl=True,
         )
+        if const_expr(self.cluster_n > 1):
+            kernel.launch(
+                grid=grid,
+                block=[self.num_threads, 1, 1],
+                cluster=(self.cluster_n, 1, 1),
+                stream=stream,
+                min_blocks_per_mp=1,
+                use_pdl=True,
+            )
+        else:
+            kernel.launch(
+                grid=grid,
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+                use_pdl=True,
+            )
 
     # -------------------------------------------------------------- device
     @cute.kernel
@@ -516,13 +556,19 @@ class WanFlashBwdSm90:
 
         Group = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = Group(1)
-        mma_warps = Group(self.num_mma_threads // cute.arch.WARP_SIZE)
+        # Q/dO multicast: each consumer warp signals the empty barrier of every
+        # CTA in the mcast pair => arrive count is warps * cluster_n
+        mma_warps = Group(
+            self.cluster_n * self.num_mma_threads // cute.arch.WARP_SIZE
+        )
+        cta_layout_vmnk = cute.make_layout((1, self.cluster_n, 1, 1))
         pipeline_q = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_Q.data_ptr(),
             num_stages=self.Q_stage,
             producer_group=tma_warp,
             consumer_group=mma_warps,
             tx_count=tma_bytes_Q + tma_bytes_stat,
+            cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
         pipeline_do = pipeline.PipelineTmaAsync.create(
@@ -531,9 +577,10 @@ class WanFlashBwdSm90:
             producer_group=tma_warp,
             consumer_group=mma_warps,
             tx_count=tma_bytes_dO + tma_bytes_stat,
+            cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+        pipeline_init_arrive(cluster_shape_mn=(self.cluster_n, 1), is_relaxed=True)
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
@@ -552,9 +599,17 @@ class WanFlashBwdSm90:
         seqlen_q = cute.size(mQ.shape[0])
         seqlen_k = cute.size(mK.shape[0])
         m_blocks = cute.ceil_div(seqlen_q, self.tile_m)
+        n_blocks = cute.ceil_div(seqlen_k, self.tile_n)
         bx, head, batch = cute.arch.block_idx()
+        tile_valid = Boolean(True)
         if const_expr(self.nsplit == 1):
             n_block = bx
+            if const_expr(self.cluster_n > 1 and n_blocks % self.cluster_n != 0):
+                # phantom pad CTA: full compute on the peer's n-block (keeps
+                # the Q/dO multicast pair in lockstep), all gmem outputs
+                # (dQ flush, dK/dV store) suppressed
+                tile_valid = n_block < n_blocks
+                n_block = cutlass.min(n_block, Int32(n_blocks - 1))
             m_lo, m_hi = 0, m_blocks
         else:
             n_block = bx // self.nsplit
@@ -563,7 +618,7 @@ class WanFlashBwdSm90:
             m_lo = split * chunk_m
             m_hi = cutlass.min(Int32(m_blocks), m_lo + chunk_m)
 
-        pipeline_init_wait(cluster_shape_mn=(1, 1))
+        pipeline_init_wait(cluster_shape_mn=(self.cluster_n, 1))
 
         if warp_idx < 4:
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
@@ -577,8 +632,8 @@ class WanFlashBwdSm90:
                     tma_bytes_K, tma_bytes_V,
                 )
             if warp_idx == 1:
-                self._dq_store(mdQaccum, sdQaccum, head, batch, m_lo, m_hi,
-                               tma_bytes_dQ)
+                self._dq_store(mdQaccum, sdQaccum, head, batch,
+                               m_lo, m_hi, tma_bytes_dQ, tile_valid)
         else:
             cute.arch.setmaxregister_increase(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
@@ -589,8 +644,14 @@ class WanFlashBwdSm90:
                 r2s_tiled_copy_dQaccum, r2s_tiled_copy_dKVaccum,
                 tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
                 pipeline_q, pipeline_do,
-                tidx, n_block, head, batch, m_lo, m_hi, seqlen_k,
+                tidx, n_block, head, batch, m_lo, m_hi, seqlen_k, tile_valid,
             )
+
+    def _has_phantom(self) -> bool:
+        """True when the padded grid has a phantom pad CTA per (head, batch)
+        (cluster_n doesn't divide n_blocks). Trace-time constant."""
+        n_blocks = -(-self.seqlen_k_static // self.tile_n)
+        return self.cluster_n > 1 and n_blocks % self.cluster_n != 0
 
     # ---------------------------------------------------- producer (warp 0)
     @cute.jit
@@ -619,13 +680,31 @@ class WanFlashBwdSm90:
         load_V, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gV, sV, single_stage=True
         )
-        load_Q, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_Q, 0, cute.make_layout(1), gQ, sQ
-        )
+        if const_expr(self.cluster_n > 1):
+            bx, _, _ = cute.arch.block_idx()
+            cluster_rank = bx % self.cluster_n
+            cluster_layout_mnk = cute.make_layout((self.cluster_n, 1, 1))
+            qdo_mcast_mask = cute.make_layout_image_mask(
+                cluster_layout_mnk,
+                cluster_layout_mnk.get_flat_coord(Int32(cluster_rank)),
+                mode=0,
+            )
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, cluster_rank, cute.make_layout(self.cluster_n),
+                gQ, sQ, mcast_mask=qdo_mcast_mask,
+            )
+            load_dO, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_dO, cluster_rank, cute.make_layout(self.cluster_n),
+                gdO, sdO, mcast_mask=qdo_mcast_mask,
+            )
+        else:
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, 0, cute.make_layout(1), gQ, sQ
+            )
+            load_dO, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
+            )
         load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_q)
-        load_dO, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
-        )
         load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_do)
         load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
         load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_q)
@@ -653,6 +732,14 @@ class WanFlashBwdSm90:
                     load_K, load_V, load_Q, load_dO, load_LSE, load_dPsum,
                     m_lo, m_hi, tma_bytes_K, tma_bytes_V,
                 )
+        if const_expr(self.cluster_n > 1):
+            # multicast consumer_release signals BOTH CTAs' empty barriers:
+            # keep this CTA resident until the peer's final arrives have
+            # landed, else its exit faults the cluster (phantom pad CTAs have
+            # a shorter epilogue and exit early without this).
+            do_state = q_state.clone()
+            pipeline_q.producer_tail(q_state)
+            pipeline_do.producer_tail(do_state)
 
     @cute.jit
     def _load_stream(
@@ -691,7 +778,8 @@ class WanFlashBwdSm90:
 
     # ------------------------------------------------- dQ store loop (warp 1)
     @cute.jit
-    def _dq_store(self, mdQaccum, sdQaccum, head, batch, m_lo, m_hi, tma_bytes_dQ):
+    def _dq_store(self, mdQaccum, sdQaccum, head, batch, m_lo, m_hi,
+                  tma_bytes_dQ, tile_valid):
         mdQaccum_cur = mdQaccum[None, head, batch]
         # ((tile_m*d/num_wg, num_wg), m_blocks) view of the flat padded buffer
         gdQaccum = cute.local_tile(
@@ -715,12 +803,16 @@ class WanFlashBwdSm90:
                     barrier_id=BAR_DQ_FULL0 + wg,
                     number_of_threads=128 + cute.arch.WARP_SIZE,
                 )
-                with cute.arch.elect_one():
-                    copy_utils.cpasync_reduce_bulk_add_f32(
-                        sdQaccum[None, wg].iterator,
-                        gdQaccum[(None, wg), i].iterator,
-                        tma_bytes_dQ,
-                    )
+                do_flush = Boolean(True)
+                if const_expr(self._has_phantom()):
+                    do_flush = tile_valid  # phantom pad CTA: no gmem add
+                if do_flush:
+                    with cute.arch.elect_one():
+                        copy_utils.cpasync_reduce_bulk_add_f32(
+                            sdQaccum[None, wg].iterator,
+                            gdQaccum[(None, wg), i].iterator,
+                            tma_bytes_dQ,
+                        )
                 cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0, read=True)
         if const_expr(self.nsplit > 1):
@@ -739,7 +831,7 @@ class WanFlashBwdSm90:
         r2s_tiled_copy_dQaccum, r2s_tiled_copy_dKVaccum,
         tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
         pipeline_q, pipeline_do,
-        tidx, n_block, head, batch, m_lo, m_hi, seqlen_k,
+        tidx, n_block, head, batch, m_lo, m_hi, seqlen_k, tile_valid,
     ):
         wg_idx = cute.arch.make_warp_uniform(tidx // 128)
         wg_layout = cute.make_layout(self.num_wg_mma, stride=128)
@@ -841,7 +933,7 @@ class WanFlashBwdSm90:
             self._epilogue_dKV(
                 acc_dV, mdV, sV, acc_dK, mdK, sK,
                 tma_atom_dK, tma_atom_dV, tiled_mma_dKV,
-                tidx, n_block, head, batch,
+                tidx, n_block, head, batch, tile_valid,
             )
             if warp_idx == 4:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -957,7 +1049,7 @@ class WanFlashBwdSm90:
     def _epilogue_dKV(
         self, acc_dV, mdV, sV, acc_dK, mdK, sK,
         tma_atom_dK, tma_atom_dV, tiled_mma_dKV,
-        tidx, n_block, head, batch,
+        tidx, n_block, head, batch, tile_valid,
     ):
         epi_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_EPI, num_threads=self.num_mma_threads
@@ -981,18 +1073,21 @@ class WanFlashBwdSm90:
             tiled_mma_dKV, sK, tidx, transpose=False, position_independent=True
         )
         # both WGs past their last-iteration wait_group(0): sK/sV are dead
+        do_store = Boolean(True)
+        if const_expr(self._has_phantom()):
+            do_store = tile_valid  # phantom pad CTA: no dK/dV gmem store
         epi_barrier.arrive_and_wait()
         copy_dV_r2s(acc_dV, dst_idx=None)
         cute.arch.fence_view_async_shared()
         epi_barrier.arrive_and_wait()
-        if warp_idx == 4:
+        if warp_idx == 4 and do_store:
             store_dV()
             cute.arch.cp_async_bulk_commit_group()
         epi_barrier.arrive_and_wait()
         copy_dK_r2s(acc_dK, dst_idx=None)
         cute.arch.fence_view_async_shared()
         epi_barrier.arrive_and_wait()
-        if warp_idx == 4:
+        if warp_idx == 4 and do_store:
             store_dK()
             cute.arch.cp_async_bulk_commit_group()
 

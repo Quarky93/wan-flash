@@ -132,6 +132,7 @@ def wan_flash_bwd(
     skv_rounded = n_blocks * f.tile_n
     nsplit = f.nsplit if f.nsplit > 0 else _auto_nsplit(n_blocks * h * b, m_blocks)
     nsplit = min(nsplit, m_blocks)
+    cluster_n = f.cluster_n if nsplit == 1 else 1  # cluster excludes split-M
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -147,7 +148,7 @@ def wan_flash_bwd(
     else:
         main_dk, main_dv = dk, dv
 
-    key = (b, sq, skv, h, d, f, nsplit)
+    key = (b, sq, skv, h, d, f, nsplit, cluster_n)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     pre_args = (
         _to_cute(o), _to_cute(do), _to_cute(lse),
@@ -166,7 +167,7 @@ def wan_flash_bwd(
         pre = WanFlashBwdPreprocessSm90(head_dim=d, tile_m=tile_m)
         main = WanFlashBwdSm90(
             head_dim=d, tile_m=tile_m, tile_n=f.tile_n, num_stages=f.num_stages,
-            nsplit=nsplit,
+            nsplit=nsplit, cluster_n=cluster_n,
         )
         post = WanFlashBwdPostprocessSm90(
             head_dim=d, tile_rows=tile_m, num_wg=main.num_wg_dQ,

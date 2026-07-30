@@ -75,6 +75,31 @@ def test_bwd_fast(shape):
     _run(shape)
 
 
+# the Q/dO-multicast cluster path (default at self shapes) needs nsplit=1
+# forced at battery sizes (auto-nsplit would split these small grids);
+# 1152 = 9 n_blocks (odd) exercises the phantom pad CTA
+ALT_CONFIGS = [
+    {"cluster_n": 2, "nsplit": 1},
+    {"cluster_n": 1, "nsplit": 1},
+]
+
+
+@requires_gpu
+@pytest.mark.parametrize("overrides", ALT_CONFIGS,
+                         ids=lambda o: f"c{o['cluster_n']}_ns{o['nsplit']}")
+@pytest.mark.parametrize("shape", [WanShape("self", 1, 2, 1152, 1152),
+                                   WanShape("self", 1, 4, 3000, 3000)],
+                         ids=lambda s: s.name)
+def test_bwd_alt_configs(shape, overrides):
+    from wan_flash import features
+
+    features.set_bwd_overrides(**overrides)
+    try:
+        _run(shape)
+    finally:
+        features.reset()
+
+
 @requires_gpu
 def test_bwd_fa3_fwd_hybrid():
     """Our bwd consuming FA3's forward outputs (the lse-contract drop-in)."""
