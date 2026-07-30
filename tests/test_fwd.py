@@ -19,6 +19,7 @@ FAST_SHAPES = [
     WanShape("self", 1, 2, 1024, 1024),
     WanShape("self", 1, 2, 960, 960),      # not a multiple of 128 -> tail path
     WanShape("self", 1, 4, 3000, 3000),    # ragged both dims
+    WanShape("self", 1, 2, 1152, 1152),    # odd m_blocks -> cluster phantom tile
     WanShape("cross", 1, 2, 2048, 512),
     WanShape("cross", 1, 2, 2048, 257),    # I2V image branch length
 ]
@@ -54,6 +55,32 @@ def _run(shape, seed=0):
 @pytest.mark.parametrize("shape", FAST_SHAPES, ids=lambda s: s.name)
 def test_fwd_fast(shape):
     _run(shape)
+
+
+# non-default scheduler/cluster combos the auto policy can select (the
+# "single" branch only triggers at self h40@75600 among Wan shapes, so it
+# needs explicit coverage; 1152 = odd m_blocks exercises the phantom tile)
+ALT_CONFIGS = [
+    {"scheduler": "single", "cluster_mn": (2, 1)},
+    {"scheduler": "single", "cluster_mn": (1, 1)},
+    {"scheduler": "persistent", "cluster_mn": (1, 1)},
+]
+
+
+@requires_gpu
+@pytest.mark.parametrize("overrides", ALT_CONFIGS,
+                         ids=lambda o: f"{o['scheduler']}_c{o['cluster_mn'][0]}")
+@pytest.mark.parametrize("shape", [WanShape("self", 1, 2, 1152, 1152),
+                                   WanShape("self", 1, 4, 3000, 3000)],
+                         ids=lambda s: s.name)
+def test_fwd_alt_configs(shape, overrides):
+    from wan_flash import features
+
+    features.set_overrides(**overrides)
+    try:
+        _run(shape)
+    finally:
+        features.reset()
 
 
 @requires_gpu

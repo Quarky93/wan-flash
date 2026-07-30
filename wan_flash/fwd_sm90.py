@@ -36,10 +36,38 @@ from cutlass.utils import LayoutEnum
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+
 from quack import sm90_utils, copy_utils, layout_utils
 
 LOG2_E = math.log2(math.e)
 LN_2 = math.log(2.0)
+
+
+@dsl_user_op
+def _cvt_f32x2_bf16x2(a, b, *, loc=None, ip=None) -> cutlass.Int32:
+    """Pack two fp32 into one bf16x2 register (cvt.rn.bf16x2.f32 d, hi, lo)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _cvt_bf16_frag(src: cute.Tensor, dst: cute.Tensor):
+    """fp32 fragment -> bf16 fragment via packed converts (the FA3/FA4 idiom;
+    TensorSSA .to() can emit one scalar cvt per element)."""
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = _cvt_f32x2_bf16x2(src[2 * i], src[2 * i + 1])
 
 # named barriers (0 is reserved for sync_threads)
 BAR_EPILOGUE = 1
@@ -60,12 +88,19 @@ class WanFlashFwdSm90:
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         scheduler: str = "single",
+        cluster_mn: tuple = (1, 1),
     ):
         assert scheduler in ("single", "persistent")
         assert head_dim % 16 == 0 and head_dim <= 256
         assert tile_m % 64 == 0
         assert tile_n % 8 == 0 and tile_n <= 256, "GMMA N must be mult of 8, <= 256"
         assert mma_pv_is_rs, "only the RS PV path is implemented"
+        assert tuple(cluster_mn) in ((1, 1), (2, 1)), "cluster: (1,1) or (2,1) only"
+        self.cluster_m = int(cluster_mn[0])
+        # cluster pairs are m-blocks of the same head sharing the K/V multicast.
+        # The persistent scheduler is cluster-aware (phantom-tile tail); the
+        # single scheduler needs m_blocks % cluster_m == 0 (checked at launch,
+        # grid x must divide by the cluster).
         self.head_dim = head_dim
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -194,12 +229,20 @@ class WanFlashFwdSm90:
         tma_copy_bytes_V = self.tile_n * self.head_dim * self.dtype.width // 8
 
         op_g2s = cpasync.CopyBulkTensorTileG2SOp()
+        # K/V multicast across the cluster-m CTAs (each loads 1/cluster_m of
+        # the box, hardware fans it out to every CTA in the mcast mask)
+        op_g2s_kv = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if const_expr(self.cluster_m > 1)
+            else op_g2s
+        )
         op_s2g = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             op_g2s, mQ, sQ_layout, (self.tile_m, self.head_dim)
         )
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-            op_g2s, mK, cute.select(sK_layout, mode=[0, 1]), (self.tile_n, self.head_dim), 1
+            op_g2s_kv, mK, cute.select(sK_layout, mode=[0, 1]),
+            (self.tile_n, self.head_dim), self.cluster_m,
         )
         # V TMA uses the unpadded (tile_n, head_dim) box layout
         sV_box_layout = cute.select(sV_layout, mode=[0, 1])
@@ -214,7 +257,7 @@ class WanFlashFwdSm90:
                 atomV, (self.tile_n, self.head_dim), order=(0, 1)
             )
         tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-            op_g2s, mV, sV_box_layout, (self.tile_n, self.head_dim), 1
+            op_g2s_kv, mV, sV_box_layout, (self.tile_n, self.head_dim), self.cluster_m
         )
         tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
             op_s2g, mO, sO_layout, (self.tile_m, self.head_dim)
@@ -224,11 +267,22 @@ class WanFlashFwdSm90:
 
         m_blocks = cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m)
         if const_expr(self.persistent):
-            total_tiles = m_blocks * cute.size(mQ.shape[2]) * cute.size(mQ.shape[3])
-            grid = (min(total_tiles, SM_COUNT), 1, 1)
+            # cluster-aware: the schedule unit is a cluster_m-pack of adjacent
+            # m-blocks of the same head (all CTAs of a cluster share K/V)
+            m_units = cute.ceil_div(m_blocks, self.cluster_m)
+            total_units = m_units * cute.size(mQ.shape[2]) * cute.size(mQ.shape[3])
+            num_clusters = min(total_units, SM_COUNT // self.cluster_m)
+            grid = (num_clusters * self.cluster_m, 1, 1)
         else:
-            grid = (m_blocks, cute.size(mQ.shape[2]), cute.size(mQ.shape[3]))
-        self.kernel(
+            # x-adjacent CTA pairs form the clusters; grid padded up to whole
+            # clusters (the pad CTA recomputes its peer's m-block, skips stores)
+            m_units = cute.ceil_div(m_blocks, self.cluster_m)
+            grid = (
+                m_units * self.cluster_m,
+                cute.size(mQ.shape[2]),
+                cute.size(mQ.shape[3]),
+            )
+        kernel = self.kernel(
             tma_tensor_Q, tma_tensor_K, tma_tensor_V, tma_tensor_O, mLSE,
             tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O,
             sQ_layout, sK_layout, sV_layout, sO_layout,
@@ -236,12 +290,22 @@ class WanFlashFwdSm90:
             tma_copy_bytes_Q, tma_copy_bytes_K, tma_copy_bytes_V,
             sV_stage_elems,
             SharedStorage,
-        ).launch(
-            grid=grid,
-            block=[self.num_threads, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=1,
         )
+        if const_expr(self.cluster_m > 1):
+            kernel.launch(
+                grid=grid,
+                block=[self.num_threads, 1, 1],
+                cluster=(self.cluster_m, 1, 1),
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
+        else:
+            kernel.launch(
+                grid=grid,
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
 
     # -------------------------------------------------------------- device
     @cute.jit
@@ -360,9 +424,10 @@ class WanFlashFwdSm90:
         """fp32 exp2 scores -> bf16 A-operand registers for the PV GMMA.
         Element order of the S accumulator and the A fragment coincide
         linearly; with tile_n_pad > tile_n the fragment tail slots stay 0.
+        Packed cvt.rn.bf16x2.f32 (acc_S size is always even).
         """
         tOrP_view = cute.make_tensor(tOrP.iterator, cute.make_layout(acc_S.shape))
-        tOrP_view.store(acc_S.load().to(self.dtype))
+        _cvt_bf16_frag(acc_S, tOrP_view)
 
     # ---- consumer-warpgroup ping-pong (FA3-style warp scheduler barrier) ----
     @cute.jit
@@ -424,6 +489,10 @@ class WanFlashFwdSm90:
         Group = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = Group(1)
         mma_warps = Group(self.num_mma_threads // cute.arch.WARP_SIZE)
+        # multicast K/V: each consumer warp signals the empty barrier of every
+        # CTA in the mcast group => arrive count is warps * cluster_m
+        mma_warps_kv = Group(self.cluster_m * self.num_mma_threads // cute.arch.WARP_SIZE)
+        cta_layout_vmnk = cute.make_layout((1, self.cluster_m, 1, 1))
         pipeline_q = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_Q.data_ptr(),
             num_stages=1,
@@ -436,19 +505,21 @@ class WanFlashFwdSm90:
             barrier_storage=storage.mbar_K.data_ptr(),
             num_stages=self.num_stages,
             producer_group=tma_warp,
-            consumer_group=mma_warps,
+            consumer_group=mma_warps_kv,
             tx_count=tma_copy_bytes_K,
+            cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
         pipeline_v = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_V.data_ptr(),
             num_stages=self.num_stages,
             producer_group=tma_warp,
-            consumer_group=mma_warps,
+            consumer_group=mma_warps_kv,
             tx_count=tma_copy_bytes_V,
+            cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+        pipeline_init_arrive(cluster_shape_mn=(self.cluster_m, 1), is_relaxed=True)
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
@@ -489,21 +560,37 @@ class WanFlashFwdSm90:
         num_heads = cute.size(mQ.shape[2])
 
         # per-CTA tile schedule: "single" = one tile from blockIdx;
-        # "persistent" = strided walk over (batch, head, m_block) tiles.
+        # "persistent" = strided walk over (batch, head, m_unit) units, where a
+        # unit is a cluster_m-pack of adjacent m-blocks (this CTA takes
+        # m_unit * cluster_m + cluster_rank). cluster_m == 1 degenerates to the
+        # plain per-tile walk. All CTAs of a cluster see the same unit count,
+        # so the K/V multicast streams stay in lockstep; a phantom tail tile
+        # (m_blocks % cluster_m != 0) recomputes its peer's m-block and only
+        # skips the O/LSE stores.
+        m_units = cute.ceil_div(m_blocks, self.cluster_m)
+        bidx, _, _ = cute.arch.block_idx()
+        cluster_rank = bidx % self.cluster_m  # 0 when cluster_m == 1
         if const_expr(self.persistent):
-            bidx, _, _ = cute.arch.block_idx()
-            total_tiles = m_blocks * num_heads * cute.size(mQ.shape[3])
-            grid_x = min(total_tiles, SM_COUNT)
-            num_my_tiles = (total_tiles - bidx + grid_x - 1) // grid_x
+            cluster_id = bidx // self.cluster_m
+            total_units = m_units * num_heads * cute.size(mQ.shape[3])
+            grid_units = min(total_units, SM_COUNT // self.cluster_m)
+            num_my_tiles = (total_units - cluster_id + grid_units - 1) // grid_units
         else:
             num_my_tiles = 1
 
-        pipeline_init_wait(cluster_shape_mn=(1, 1))
+        pipeline_init_wait(cluster_shape_mn=(self.cluster_m, 1))
 
         if warp_idx < 4:
             # ======================= PRODUCER =======================
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             if warp_idx == 0:
+                if const_expr(self.cluster_m > 1):
+                    cluster_layout_mnk = cute.make_layout((self.cluster_m, 1, 1))
+                    kv_mcast_mask = cute.make_layout_image_mask(
+                        cluster_layout_mnk,
+                        cluster_layout_mnk.get_flat_coord(Int32(cluster_rank)),
+                        mode=0,
+                    )
                 q_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, 1
                 )
@@ -512,13 +599,18 @@ class WanFlashFwdSm90:
                 )
                 for tile in cutlass.range(num_my_tiles, unroll=1):
                     if const_expr(self.persistent):
-                        tile_id = bidx + tile * grid_x
-                        batch = tile_id // (m_blocks * num_heads)
-                        rest = tile_id % (m_blocks * num_heads)
-                        head = rest // m_blocks
-                        m_block = rest % m_blocks
+                        unit_id = cluster_id + tile * grid_units
+                        batch = unit_id // (m_units * num_heads)
+                        rest = unit_id % (m_units * num_heads)
+                        head = rest // m_units
+                        m_block = rest % m_units * self.cluster_m + cluster_rank
+                        if const_expr(m_blocks % self.cluster_m != 0):
+                            # phantom tail pair: recompute the peer's m-block
+                            m_block = cutlass.min(m_block, Int32(m_blocks - 1))
                     else:
                         m_block, head, batch = cute.arch.block_idx()
+                        if const_expr(m_blocks % self.cluster_m != 0):
+                            m_block = cutlass.min(m_block, Int32(m_blocks - 1))
                     mQ_cur = mQ[None, None, head, batch]
                     mK_cur = mK[None, None, head, batch]
                     mV_cur = mV[None, None, head, batch]
@@ -528,12 +620,24 @@ class WanFlashFwdSm90:
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
                     )
-                    load_K, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1), gK, sK
-                    )
-                    load_V, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV, sV
-                    )
+                    if const_expr(self.cluster_m > 1):
+                        load_K, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K, cluster_rank,
+                            cute.make_layout(self.cluster_m), gK, sK,
+                            mcast_mask=kv_mcast_mask,
+                        )
+                        load_V, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_V, cluster_rank,
+                            cute.make_layout(self.cluster_m), gV, sV,
+                            mcast_mask=kv_mcast_mask,
+                        )
+                    else:
+                        load_K, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K, 0, cute.make_layout(1), gK, sK
+                        )
+                        load_V, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_V, 0, cute.make_layout(1), gV, sV
+                        )
                     load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
                     load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
 
@@ -630,21 +734,30 @@ class WanFlashFwdSm90:
                     )
 
             for tile in cutlass.range(num_my_tiles, unroll=1):
+                tile_valid = cutlass.Boolean(True)
                 if const_expr(self.persistent):
-                    tile_id = bidx + tile * grid_x
-                    batch = tile_id // (m_blocks * num_heads)
-                    rest = tile_id % (m_blocks * num_heads)
-                    head = rest // m_blocks
-                    m_block = rest % m_blocks
+                    unit_id = cluster_id + tile * grid_units
+                    batch = unit_id // (m_units * num_heads)
+                    rest = unit_id % (m_units * num_heads)
+                    head = rest // m_units
+                    m_block = rest % m_units * self.cluster_m + cluster_rank
+                    if const_expr(m_blocks % self.cluster_m != 0):
+                        # phantom tail pair: full compute on the peer's
+                        # m-block (keeps the cluster lockstep), stores skipped
+                        tile_valid = m_block < m_blocks
+                        m_block = cutlass.min(m_block, Int32(m_blocks - 1))
                 else:
                     m_block, head, batch = cute.arch.block_idx()
+                    if const_expr(m_blocks % self.cluster_m != 0):
+                        tile_valid = m_block < m_blocks
+                        m_block = cutlass.min(m_block, Int32(m_blocks - 1))
                 q_state, kv_state = self._consumer_tile(
                     mO, mLSE, sO, sQ, tiled_mma_qk, tiled_mma_pv, thr_mma_qk,
                     thr_mma_pv, mma_qk_fn, mma_pv_fn, acc_O, tOrP,
                     row_max, row_sum, row_scale, num_rows,
                     pipeline_q, pipeline_k, pipeline_v, q_state, kv_state,
                     tma_atom_O, st_atom_O, thr_copy_O, taccOcO, t0accOcO,
-                    tidx, wg_idx, warp_idx_c, m_block, head, batch,
+                    tidx, wg_idx, warp_idx_c, m_block, head, batch, tile_valid,
                     seqlen_q, seqlen_k, n_blocks, n_tail,
                 )
 
@@ -655,10 +768,16 @@ class WanFlashFwdSm90:
         row_max, row_sum, row_scale, num_rows: cutlass.Constexpr[int],
         pipeline_q, pipeline_k, pipeline_v, q_state, kv_state,
         tma_atom_O, st_atom_O, thr_copy_O, taccOcO, t0accOcO,
-        tidx, wg_idx, warp_idx_c, m_block, head, batch,
+        tidx, wg_idx, warp_idx_c, m_block, head, batch, tile_valid,
         seqlen_q: cutlass.Constexpr[int], seqlen_k: cutlass.Constexpr[int],
         n_blocks: cutlass.Constexpr[int], n_tail: cutlass.Constexpr[int],
     ):
+            # phantom tiles (cluster tail) exist only when cluster_m doesn't
+            # divide m_blocks; everywhere else tile_valid folds to constant True
+            has_phantom = const_expr(
+                self.cluster_m > 1
+                and cute.ceil_div(seqlen_q, self.tile_m) % self.cluster_m != 0
+            )
             pipeline_q.consumer_wait(q_state, pipeline_q.consumer_try_wait(q_state))
 
             if const_expr(self.intra_wg_overlap):
@@ -752,7 +871,7 @@ class WanFlashFwdSm90:
 
             # ---- epilogue: O -> smem (StMatrix) -> gmem (TMA); LSE direct
             rO = cute.make_fragment_like(acc_O, self.dtype)
-            rO.store(acc_O.load().to(self.dtype))
+            _cvt_bf16_frag(acc_O, rO)
             if const_expr(self.persistent):
                 # wait until the previous tile's O TMA drained sO (also joins
                 # the two consumer WGs, keeping the tile step in lock-step)
@@ -775,7 +894,10 @@ class WanFlashFwdSm90:
                 cute.append(gLSE.layout, cute.make_layout(self.head_dim, stride=0)),
             )
             taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gLSE_expanded))
-            if taccOcO[0][1] == 0:  # lanes owning column 0
+            lse_lane = taccOcO[0][1] == 0  # lanes owning column 0
+            if const_expr(has_phantom):
+                lse_lane = lse_lane & tile_valid
+            if lse_lane:
                 row_limit = seqlen_q - m_block * self.tile_m - taccOcO[0][0]
                 for r in cutlass.range_constexpr(num_rows):
                     if t0accOcO[r, 0][0] < row_limit:
@@ -796,9 +918,15 @@ class WanFlashFwdSm90:
                     barrier_id=BAR_EPILOGUE,
                     number_of_threads=self.num_mma_threads + cute.arch.WARP_SIZE,
                 )
-                store_O()
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if const_expr(has_phantom):
+                    if tile_valid:
+                        store_O()
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    store_O()
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 if const_expr(self.persistent):
                     cute.arch.barrier_arrive(
                         barrier_id=BAR_O_FREE,

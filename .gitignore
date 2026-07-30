@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 results/
 scratch/*.log
+wan_flash.egg-info/
+__pycache__/
+*.pyc

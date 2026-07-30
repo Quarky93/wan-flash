@@ -43,7 +43,19 @@ def wan_flash_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     lse = torch.empty(b, h, sq, device=q.device, dtype=torch.float32)
 
     f = features.get()
-    key = (b, sq, skv, h, d, f)
+    scheduler = f.scheduler
+    if scheduler == "auto":
+        # measured policy (docs/FEATURES.md): persistent wins everywhere
+        # except long-chain large-KV shapes, where the persistent walk keeps
+        # each cluster pair coupled for the whole kernel and measures ~1.5%
+        # slower than single (pairs retire per tile). Wan shapes: only self
+        # h40@75600 lands in the "single" bucket.
+        cluster_m = f.cluster_mn[0]
+        m_units = -(-sq // (f.tile_m * cluster_m))
+        units_per_slot = (b * h * m_units) / max(1, 132 // cluster_m)
+        n_blocks = -(-skv // f.tile_n)
+        scheduler = "single" if units_per_slot >= 128 and n_blocks >= 16 else "persistent"
+    key = (b, sq, skv, h, d, f, scheduler)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     cargs = (_to_cute(q), _to_cute(k), _to_cute(v), _to_cute(o), _to_cute(lse))
     if key not in _compile_cache:
@@ -55,7 +67,8 @@ def wan_flash_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
             rescale_skip_threshold=f.rescale_skip_threshold,
             intra_wg_overlap=f.intra_wg_overlap,
             mma_pv_is_rs=f.mma_pv_is_rs,
-            scheduler=f.scheduler,
+            scheduler=scheduler,
+            cluster_mn=f.cluster_mn,
         )
         _compile_cache[key] = cute.compile(kernel, *cargs, stream)
     _compile_cache[key](*cargs, stream)

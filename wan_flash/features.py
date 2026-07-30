@@ -16,6 +16,10 @@ Flags (fwd):
   tile_m / tile_n         CTA tile sizes (per-shape override allowed).
   scheduler               "single" (FA4 sm90 default) | "lpt" | "persistent"
                           (FA3-style persistent worker grid).
+  cluster_mn              (2, 1): 2-CTA cluster, K/V TMA multicast across the
+                          two m-blocks of a head pair (halves K/V L2/HBM
+                          traffic; the C++ FA3 hopper trick FA4 sm90 leaves
+                          unused). (1, 1) = no cluster.
 """
 
 from dataclasses import dataclass, replace
@@ -30,7 +34,12 @@ class FwdFeatures:
     num_stages: int = 2                  # 3 was ~flat, no smem headroom left
     tile_m: int = 128
     tile_n: int = 128                    # 120/144/160/176/192 all measured slower
-    scheduler: str = "persistent"        # +1.5% self@32760, +15% cross
+    # "auto": persistent everywhere except long-chain large-KV shapes (units
+    # per cluster slot >= 128 and n_blocks >= 16 -> "single"; only self
+    # h40@75600 among Wan shapes), where the per-kernel cluster-pair coupling
+    # of the persistent walk measures ~1.5% slower than retiring pairs per tile
+    scheduler: str = "auto"
+    cluster_mn: tuple = (2, 1)           # K/V TMA multicast pairs: +2-3% self
 
 
 @dataclass(frozen=True)
