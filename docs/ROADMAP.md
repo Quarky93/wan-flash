@@ -28,7 +28,7 @@ key facts:
 |---|---|---|
 | Pinned-memory H2D fix in trainer data path | −0.4% step @480p | **KEPT: −0.27%** synthetic, neutral real-data; batches bitwise-identical |
 | 4-wide FADD tree for row_sum (mirrors the measured fmax win) | +0.3–1.0% fwd | **REJECTED: 0.3–0.9% slower** all self shapes (ABBA A/B; row_sum is off the exp2 critical path — see FEATURES.md) |
-| batch=2 instead of 2× grad-accum (**recipe-permitting**) | −1–1.5% step/sample | **480p: −0.6…−1.0%/sample (+4.2 GiB); 720p: neutral (+13.3 GiB).** Report-only; defaults unchanged |
+| batch=2 instead of 2× grad-accum (**recipe-permitting**) | −1–1.5% step/sample | **EXCLUDED by user constraint (no VRAM increases).** Measured for the record: 480p −0.6…−1.0%/sample (+4.2 GiB); 720p neutral (+13.3 GiB) |
 | cvt hygiene + cross zero_init tidy | ~0, bit-neutral | **AUDIT CLEAN** — narrowing cvts already packed; fills ≈14 µs (0.6% of chain) |
 
 ## Phase 2 — the dQ campaign (~1–1.5 weeks, medium risk)
