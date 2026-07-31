@@ -61,6 +61,12 @@ class BwdFeatures:
                 TMA multicast (halves the dominant L2 read stream of the
                 dK/dV-stationary loop). Self-attn shapes only (forced to 1
                 when the auto/explicit nsplit > 1).
+    dq_cluster_reduce
+                Cluster-pair dQ reduction over DSM (roadmap Phase 2): rank 1
+                bulk-reduce-adds its sdQaccum chunk into rank 0's smem
+                (cp.reduce.async.bulk.shared::cluster) and only rank 0
+                flushes to gmem — halves the dQaccum L2-RMW stream. Only
+                active when cluster_n == 2 and nsplit == 1.
     """
 
     tile_m: int = 80
@@ -68,6 +74,7 @@ class BwdFeatures:
     num_stages: int = 2
     nsplit: int = 0
     cluster_n: int = 2   # Q/dO TMA multicast pairs: beats FA4 at all self shapes
+    dq_cluster_reduce: bool = False  # Phase 2 candidate, under A/B
 
 
 _current = FwdFeatures()

@@ -82,6 +82,67 @@ def _cvt_bf16_frag(src: cute.Tensor) -> cute.Tensor:
         dst_i32[i] = _cvt_f32x2_bf16x2(src[2 * i], src[2 * i + 1])
     return dst
 
+@dsl_user_op
+def _mapa_shared_u32(smem_addr_i32, peer_rank, *, loc=None, ip=None) -> Int32:
+    """Map a local shared::cta address to peer_rank's shared::cluster window."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr_i32).ir_value(loc=loc, ip=ip),
+             Int32(peer_rank).ir_value(loc=loc, ip=ip)],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _dsm_ld_v4x5(peer_addr_i32, stride_bytes: int, *, loc=None, ip=None):
+    """Load 5 v4 fp32 groups (+0..+4s) from the PEER CTA's smem into
+    registers. Split from the add+store (_addto_v4x5) so the DSM latency can
+    be hidden under WGMMA issue between the two calls. sm90 has no fp32 DSM
+    reduce (probed: cp.reduce.async.bulk.shared::cluster and red.async are
+    integer-only), so peer combining is explicit ld+add+st."""
+    s = [k * stride_bytes for k in range(5)]
+    vals = cute.arch.inline_ptx(
+        "ld.shared::cluster.v4.f32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}];\n\t"
+        f"ld.shared::cluster.v4.f32 {{{{$w4}}, {{$w5}}, {{$w6}}, {{$w7}}}}, [{{$r0}}+{s[1]}];\n\t"
+        f"ld.shared::cluster.v4.f32 {{{{$w8}}, {{$w9}}, {{$w10}}, {{$w11}}}}, [{{$r0}}+{s[2]}];\n\t"
+        f"ld.shared::cluster.v4.f32 {{{{$w12}}, {{$w13}}, {{$w14}}, {{$w15}}}}, [{{$r0}}+{s[3]}];\n\t"
+        f"ld.shared::cluster.v4.f32 {{{{$w16}}, {{$w17}}, {{$w18}}, {{$w19}}}}, [{{$r0}}+{s[4]}];",
+        write_only_types=[Float32] * 20,
+        read_only_args=[Int32(peer_addr_i32)],
+        loc=loc,
+        ip=ip,
+    )
+    return vals
+
+
+@dsl_user_op
+def _addto_v4x5(local_addr_i32, vals, stride_bytes: int, *, loc=None, ip=None):
+    """local[g] += vals[g] for 5 v4 groups at +0..+4s bytes (local smem)."""
+    args = [Int32(local_addr_i32)] + [Float32(v) for v in vals]
+    lines = []
+    for g in range(5):
+        off = f"+{g * stride_bytes}" if g else ""
+        r = [f"{{$r{1 + 4 * g + j}}}" for j in range(4)]
+        lines.append(
+            "ld.shared.v4.f32 {la, lb, lc, ld_}, [{$r0}" + off + "];\n\t"
+            f"add.f32 la, la, {r[0]}; add.f32 lb, lb, {r[1]};\n\t"
+            f"add.f32 lc, lc, {r[2]}; add.f32 ld_, ld_, {r[3]};\n\t"
+            "st.shared.v4.f32 [{$r0}" + off + "], {la, lb, lc, ld_};"
+        )
+    cute.arch.inline_ptx(
+        "{\n\t.reg .f32 la, lb, lc, ld_;\n\t" + "\n\t".join(lines) + "\n\t}",
+        read_only_args=args,
+        loc=loc,
+        ip=ip,
+    )
+
+
 # named barriers (0 is reserved for sync_threads)
 BAR_PDS = 1          # sequences the sdS buffer between the two MMA WGs
 BAR_DQ_EMPTY0 = 2    # +wg_idx: store warp released sdQaccum chunk wg
@@ -247,6 +308,7 @@ class WanFlashBwdSm90:
         num_stages: int = 2,
         nsplit: int = 1,
         cluster_n: int = 1,
+        dq_cluster_reduce: bool = False,
     ):
         self.num_wg_mma = 2
         assert head_dim % 16 == 0 and head_dim <= 128
@@ -260,6 +322,13 @@ class WanFlashBwdSm90:
             # are shared via TMA multicast. Not combined with split-M.
             assert nsplit == 1, "cluster_n requires nsplit == 1"
         self.cluster_n = cluster_n
+        # Cluster-pair dQ reduction over DSM: rank 1 bulk-reduce-adds its
+        # sdQaccum chunk into rank 0's smem (cp.reduce.async.bulk
+        # .shared::cluster) and only rank 0 flushes to gmem — halves the
+        # dQaccum L2-RMW stream. Pairs are m-block-lockstepped already
+        # (shared Q/dO multicast pipelines), so peer chunks cover the same
+        # rows every iteration.
+        self.use_dq_dsm = bool(dq_cluster_reduce) and cluster_n == 2 and nsplit == 1
         self.head_dim = head_dim
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -280,7 +349,12 @@ class WanFlashBwdSm90:
         self.num_mma_threads = 128 * self.num_wg_mma
         self.num_threads = 128 * (self.num_wg_mma + 1)
         self.num_mma_regs = 240
+        # NOTE 24 is a hard wall: producers at 32 would need 240*256 + 32*128
+        # = 65,536 = the whole register file, which launch granularity cannot
+        # provide — setmaxnreg.inc then blocks forever (measured hang).
         self.num_producer_regs = 24
+        # dq_cluster_reduce: each rank combines+flushes half of every chunk
+        self.dsm_half_bytes = tile_m * head_dim // self.num_wg_mma // 2 * 4
         self.softmax_scale = 1.0 / math.sqrt(head_dim)
         self.scale_log2 = self.softmax_scale * LOG2_E
 
@@ -358,10 +432,20 @@ class WanFlashBwdSm90:
         ]
         stat_elems = _round_up(self.tile_m, 64)
 
+        # DSM handshake mbars, 2 per WG chunk at every CTA (symmetric —
+        # each rank combines + flushes ITS HALF of every chunk):
+        #   [0*num_wg + wg] data_ready: peer arrives (remote) once its chunk
+        #                   wg is published -> my crew may remote-read it
+        #   [1*num_wg + wg] src_free: peer arrives (remote) once its crew is
+        #                   done reading my chunk wg -> my MMA may overwrite
+        # One use per m-block: wait parity = (i - m_lo) & 1.
+        n_dsm_mbar = 2 * self.num_wg_dQ if self.use_dq_dsm else 0
+
         @cute.struct
         class SharedStorage:
             mbar_Q: cute.struct.MemRange[cutlass.Int64, self.Q_stage * 2]
             mbar_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
+            mbar_dq_dsm: cute.struct.MemRange[cutlass.Int64, n_dsm_mbar]
             sLSE: cute.struct.Align[
                 cute.struct.MemRange[Float32, stat_elems * self.Q_stage], 128
             ]
@@ -580,6 +664,16 @@ class WanFlashBwdSm90:
             cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
+        if const_expr(self.use_dq_dsm):
+            # init the DSM handshake mbars before the cluster-wide init fence
+            # (pipeline_init_arrive/wait) so peers never see uninitialized ones
+            if warp_idx == 1:
+                with cute.arch.elect_one():
+                    for j in cutlass.range_constexpr(2 * self.num_wg_dQ):
+                        cute.arch.mbarrier_init(
+                            storage.mbar_dq_dsm.data_ptr() + j, 1
+                        )
+                cute.arch.mbarrier_init_fence()
         pipeline_init_arrive(cluster_shape_mn=(self.cluster_n, 1), is_relaxed=True)
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -602,6 +696,8 @@ class WanFlashBwdSm90:
         n_blocks = cute.ceil_div(seqlen_k, self.tile_n)
         bx, head, batch = cute.arch.block_idx()
         tile_valid = Boolean(True)
+        dsm_rank = Int32(0)
+        dsm_pair = Boolean(False)
         if const_expr(self.nsplit == 1):
             n_block = bx
             if const_expr(self.cluster_n > 1 and n_blocks % self.cluster_n != 0):
@@ -611,6 +707,14 @@ class WanFlashBwdSm90:
                 tile_valid = n_block < n_blocks
                 n_block = cutlass.min(n_block, Int32(n_blocks - 1))
             m_lo, m_hi = 0, m_blocks
+            if const_expr(self.use_dq_dsm):
+                dsm_rank = bx % 2
+                dsm_pair = Boolean(True)
+                if const_expr(self._has_phantom()):
+                    # the pair holding the phantom CTA keeps the per-CTA
+                    # flush path: the phantom recomputes rank 0's n-block,
+                    # so its dQ is a duplicate and must not be added
+                    dsm_pair = (bx - dsm_rank) + 1 < n_blocks
         else:
             n_block = bx // self.nsplit
             split = bx % self.nsplit
@@ -633,7 +737,10 @@ class WanFlashBwdSm90:
                 )
             if warp_idx == 1:
                 self._dq_store(mdQaccum, sdQaccum, head, batch,
-                               m_lo, m_hi, tma_bytes_dQ, tile_valid)
+                               m_lo, m_hi, tma_bytes_dQ, tile_valid,
+                               dsm_rank, dsm_pair,
+                               storage.mbar_dq_dsm.data_ptr()
+                               if const_expr(self.use_dq_dsm) else None)
         else:
             cute.arch.setmaxregister_increase(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
@@ -645,7 +752,18 @@ class WanFlashBwdSm90:
                 tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
                 pipeline_q, pipeline_do,
                 tidx, n_block, head, batch, m_lo, m_hi, seqlen_k, tile_valid,
+                dsm_pair, dsm_rank,
+                storage.mbar_dq_dsm.data_ptr()
+                if const_expr(self.use_dq_dsm) else None,
             )
+        if const_expr(self.use_dq_dsm):
+            # exit safety (the CUDA-719 class): no CTA may exit while its
+            # peer could still target its smem (DSM adds, remote mbarrier
+            # arrives). All handshakes are consumed in-loop; this final
+            # cluster barrier makes the last posted remote ops land before
+            # either CTA of the pair retires.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
 
     def _has_phantom(self) -> bool:
         """True when the padded grid has a phantom pad CTA per (head, batch)
@@ -779,7 +897,7 @@ class WanFlashBwdSm90:
     # ------------------------------------------------- dQ store loop (warp 1)
     @cute.jit
     def _dq_store(self, mdQaccum, sdQaccum, head, batch, m_lo, m_hi,
-                  tma_bytes_dQ, tile_valid):
+                  tma_bytes_dQ, tile_valid, dsm_rank, dsm_pair, mbar_dsm):
         mdQaccum_cur = mdQaccum[None, head, batch]
         # ((tile_m*d/num_wg, num_wg), m_blocks) view of the flat padded buffer
         gdQaccum = cute.local_tile(
@@ -788,6 +906,22 @@ class WanFlashBwdSm90:
                                self.num_wg_dQ)),),
             (None,),
         )
+        if const_expr(not self.use_dq_dsm):
+            self._dq_store_solo(sdQaccum, gdQaccum, m_lo, m_hi,
+                                tma_bytes_dQ, tile_valid)
+        else:
+            if ~dsm_pair:
+                # fallback for the pair holding the phantom CTA
+                self._dq_store_solo(sdQaccum, gdQaccum, m_lo, m_hi,
+                                    tma_bytes_dQ, tile_valid)
+            else:
+                self._dq_store_dsm(sdQaccum, gdQaccum, m_lo, m_hi,
+                                   tma_bytes_dQ, dsm_rank, mbar_dsm)
+
+    @cute.jit
+    def _dq_store_solo(self, sdQaccum, gdQaccum, m_lo, m_hi,
+                       tma_bytes_dQ, tile_valid):
+        """Per-CTA flush: every CTA bulk-reduce-adds its own chunks to gmem."""
         for i in cutlass.range(m_lo, m_hi, unroll=1):
             for wg in cutlass.range_constexpr(self.num_wg_dQ):
                 # previous bulk-add from chunk wg must have read sdQaccum out
@@ -823,6 +957,62 @@ class WanFlashBwdSm90:
                     number_of_threads=128 + cute.arch.WARP_SIZE,
                 )
 
+    @cute.jit
+    def _dq_store_dsm(self, sdQaccum, gdQaccum, m_lo, m_hi,
+                      tma_bytes_dQ, dsm_rank, mbar_dsm):
+        """Cluster-pair flush: rank 1 DSM-copies each chunk into rank 0's
+        sdQaccum BEFORE rank 0's MMA WG fills it; that WG then += its own
+        acc on top (no fp32 DSM reduce exists on sm90) and rank 0 issues ONE
+        gmem bulk-add per pair — halving the dQaccum L2-RMW stream. The pair
+        is m-block-lockstepped by the shared Q/dO multicast pipelines, so
+        chunk i covers the same rows in both CTAs.
+
+        Handshake per (m-block i, chunk wg), parity phase = (i - m_lo) & 1:
+          rank0 store: [drain flush] -> EMPTY + arrive buf_free@1 ->
+                       FULL (peer data + own acc summed) -> gmem add
+          rank0 MMA (in _mma_m_block): EMPTY -> expect_tx + wait dsm_full ->
+                       += acc -> arrive src_free@1 -> FULL
+          rank1 store: FULL -> wait buf_free -> DSM copy (tx -> rank0
+                       dsm_full) -> wait src_free -> release EMPTY
+        Each agent posts its outgoing arrive before blocking on the matching
+        wait; counts balance exactly, and the kernel-end cluster barrier
+        covers the last posted remote ops."""
+        half_elems = self.tile_m * self.head_dim // self.num_wg_dQ // 2
+        for wg in cutlass.range_constexpr(self.num_wg_dQ):
+            cute.arch.barrier_arrive(  # initial: buffers start empty
+                barrier_id=BAR_DQ_EMPTY0 + wg,
+                number_of_threads=128 + cute.arch.WARP_SIZE,
+            )
+        for i in cutlass.range(m_lo, m_hi, unroll=1):
+            for wg in cutlass.range_constexpr(self.num_wg_dQ):
+                # FULL now means: my half of chunk wg holds the PAIR sum
+                # (the MMA WGs run the DSM handshake and combine; FULL for
+                # block i arrives during block i+1)
+                cute.arch.barrier(
+                    barrier_id=BAR_DQ_FULL0 + wg,
+                    number_of_threads=128 + cute.arch.WARP_SIZE,
+                )
+                with cute.arch.elect_one():
+                    # flush MY half: one gmem RMW per half per PAIR (the
+                    # peer flushes the other half)
+                    copy_utils.cpasync_reduce_bulk_add_f32(
+                        sdQaccum[None, wg].iterator + dsm_rank * half_elems,
+                        gdQaccum[(None, wg), i].iterator
+                        + dsm_rank * half_elems,
+                        tma_bytes_dQ // 2,
+                    )
+                cute.arch.cp_async_bulk_commit_group()
+            if i + 1 < m_hi:  # EMPTY releases for fill i+1 (arrives == fills)
+                for wg in cutlass.range_constexpr(self.num_wg_dQ):
+                    cute.arch.cp_async_bulk_wait_group(
+                        self.num_wg_dQ - 1 - wg, read=True
+                    )
+                    cute.arch.barrier_arrive(
+                        barrier_id=BAR_DQ_EMPTY0 + wg,
+                        number_of_threads=128 + cute.arch.WARP_SIZE,
+                    )
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+
     # -------------------------------------------------- consumers (2 MMA WGs)
     @cute.jit
     def _mma(
@@ -832,6 +1022,7 @@ class WanFlashBwdSm90:
         tiled_mma_SdP, tiled_mma_dKV, tiled_mma_dQ,
         pipeline_q, pipeline_do,
         tidx, n_block, head, batch, m_lo, m_hi, seqlen_k, tile_valid,
+        dsm_active, dsm_rank, mbar_dsm,
     ):
         wg_idx = cute.arch.make_warp_uniform(tidx // 128)
         wg_layout = cute.make_layout(self.num_wg_mma, stride=128)
@@ -914,6 +1105,13 @@ class WanFlashBwdSm90:
         c_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.Q_stage
         )
+        dsm_base = Int32(0)
+        if const_expr(self.use_dq_dsm):
+            # my lane's v4 slice of MY half of my WG's chunk
+            dsm_base = (
+                sdQaccum[None, wg_idx].iterator.toint()
+                + dsm_rank * self.dsm_half_bytes + (tidx % 128) * 16
+            )
         dKV_accumulate = Boolean(False)
         for m_block in cutlass.range(m_lo, m_hi, unroll=1):
             c_state = self._mma_m_block(
@@ -923,8 +1121,34 @@ class WanFlashBwdSm90:
                 tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
                 thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
                 PdS_barrier, dKV_accumulate,
+                dsm_active, dsm_rank, mbar_dsm, m_block - m_lo, dsm_base,
             )
             dKV_accumulate = Boolean(True)
+        if const_expr(self.use_dq_dsm):
+            if dsm_active:
+                # combine + publish the LAST block (its combine has no next
+                # block to ride on; one exposed DSM latency per kernel)
+                cute.arch.mbarrier_wait(
+                    mbar_dsm + wg_idx, (m_hi - 1 - m_lo) & 1
+                )
+                vals = _dsm_ld_v4x5(
+                    _mapa_shared_u32(dsm_base, 1 - dsm_rank), 128 * 16
+                )
+                _addto_v4x5(dsm_base, vals, 128 * 16)
+                warp_in_wg = cute.arch.make_warp_uniform(
+                    cute.arch.warp_idx() % 4
+                )
+                if warp_in_wg == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(
+                            mbar_dsm + self.num_wg_dQ + wg_idx,
+                            peer_cta_rank_in_cluster=1 - dsm_rank,
+                        )
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier_arrive(
+                    barrier_id=BAR_DQ_FULL0 + wg_idx,
+                    number_of_threads=128 + cute.arch.WARP_SIZE,
+                )
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         acc_dK.store(acc_dK.load() * self.softmax_scale)
@@ -952,9 +1176,27 @@ class WanFlashBwdSm90:
         tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
         thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
         PdS_barrier, dKV_accumulate: Boolean,
+        dsm_active, dsm_rank, mbar_dsm, rel, dsm_base,
     ):
         smem_idx = c_state.index
         smem_idx_PdS = smem_idx if const_expr(self.PdS_stage > 1) else 0
+
+        # DSM combine, part 1 (lagged): the PREVIOUS block's chunk pair is
+        # complete on both CTAs — issue the remote loads of the peer's
+        # values now so their latency hides under GEMM 1/2 issue below.
+        # (dsm_base = my lane's slice of MY half of my chunk, precomputed in
+        # _mma; the rmem fragment carries values across the runtime branches)
+        dsm_combine = Boolean(False)
+        if const_expr(self.use_dq_dsm):
+            dsm_combine = dsm_active & (rel > 0)
+            dsm_frag = cute.make_rmem_tensor(20, Float32)
+            if dsm_combine:
+                cute.arch.mbarrier_wait(mbar_dsm + wg_idx, (rel - 1) & 1)
+                vals = _dsm_ld_v4x5(
+                    _mapa_shared_u32(dsm_base, 1 - dsm_rank), 128 * 16
+                )
+                for j in cutlass.range_constexpr(20):
+                    dsm_frag[j] = vals[j]
 
         # [GEMM 1] S^T = K @ Q^T
         pipeline_q.consumer_wait(c_state, pipeline_q.consumer_try_wait(c_state))
@@ -963,6 +1205,32 @@ class WanFlashBwdSm90:
         # [GEMM 2] dP^T = V @ dO^T
         pipeline_do.consumer_wait(c_state, pipeline_do.consumer_try_wait(c_state))
         acc_dP = mma_dov_fn(A_idx=smem_idx, wg_wait=1)  # waits GEMM 1
+
+        # DSM combine, part 2: fold the peer's values into MY half of the
+        # previous block's chunk and publish it to the store warp (FULL was
+        # withheld at the bottom of the previous block for exactly this)
+        if const_expr(self.use_dq_dsm):
+            if dsm_combine:
+                _addto_v4x5(
+                    dsm_base,
+                    tuple(dsm_frag[j] for j in range(20)),
+                    128 * 16,
+                )
+                warp_in_wg = cute.arch.make_warp_uniform(
+                    cute.arch.warp_idx() % 4
+                )
+                if warp_in_wg == 0:
+                    with cute.arch.elect_one():
+                        # peer may overwrite its chunk now
+                        cute.arch.mbarrier_arrive(
+                            mbar_dsm + self.num_wg_dQ + wg_idx,
+                            peer_cta_rank_in_cluster=1 - dsm_rank,
+                        )
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier_arrive(
+                    barrier_id=BAR_DQ_FULL0 + wg_idx,
+                    number_of_threads=128 + cute.arch.WARP_SIZE,
+                )
 
         # K-tail mask: predicated selects, every iteration (FA4 behavior; a
         # runtime skip-branch for non-tail CTAs was measured SLOWER -- the
@@ -1033,12 +1301,36 @@ class WanFlashBwdSm90:
         tdQrdQaccum_flat = cute.make_tensor(
             acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape)
         )
-        cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
-        cute.arch.fence_view_async_shared()
-        cute.arch.barrier_arrive(
-            barrier_id=BAR_DQ_FULL0 + wg_idx,
-            number_of_threads=128 + cute.arch.WARP_SIZE,
-        )
+        publish_now = Boolean(True)
+        if const_expr(self.use_dq_dsm):
+            publish_now = ~dsm_active
+            if dsm_active:
+                if rel > 0:
+                    # peer's combine must have read my previous chunk before
+                    # I overwrite it
+                    cute.arch.mbarrier_wait(
+                        mbar_dsm + self.num_wg_dQ + wg_idx, (rel - 1) & 1
+                    )
+                cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+                warp_in_wg = cute.arch.make_warp_uniform(
+                    cute.arch.warp_idx() % 4
+                )
+                if warp_in_wg == 0:
+                    with cute.arch.elect_one():
+                        # my chunk is published for the peer's combine; FULL
+                        # (for my own store warp) is withheld until the
+                        # combine at the top of the NEXT block
+                        cute.arch.mbarrier_arrive(
+                            mbar_dsm + wg_idx,
+                            peer_cta_rank_in_cluster=1 - dsm_rank,
+                        )
+        if publish_now:
+            cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier_arrive(
+                barrier_id=BAR_DQ_FULL0 + wg_idx,
+                number_of_threads=128 + cute.arch.WARP_SIZE,
+            )
 
         warpgroup.wait_group(0)  # GEMM 5 done (sQ free)
         pipeline_q.consumer_release(c_state)

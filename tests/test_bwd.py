@@ -81,6 +81,9 @@ def test_bwd_fast(shape):
 ALT_CONFIGS = [
     {"cluster_n": 2, "nsplit": 1},
     {"cluster_n": 1, "nsplit": 1},
+    # cluster-pair dQ DSM reduction (1152 = odd n_blocks -> phantom-pair
+    # fallback path; 3000 = even n_blocks -> DSM active on all pairs)
+    {"cluster_n": 2, "nsplit": 1, "dq_cluster_reduce": True},
 ]
 
 

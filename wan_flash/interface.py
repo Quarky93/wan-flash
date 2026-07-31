@@ -168,6 +168,7 @@ def wan_flash_bwd(
         main = WanFlashBwdSm90(
             head_dim=d, tile_m=tile_m, tile_n=f.tile_n, num_stages=f.num_stages,
             nsplit=nsplit, cluster_n=cluster_n,
+            dq_cluster_reduce=f.dq_cluster_reduce,
         )
         post = WanFlashBwdPostprocessSm90(
             head_dim=d, tile_rows=tile_m, num_wg=main.num_wg_dQ,
