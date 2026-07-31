@@ -22,14 +22,14 @@ key facts:
   net NEGATIVE). Cross-attn redesign: bounded at ~0.3% step. max_offset:
   an FP8 saturation trick, identically 0 at bf16 — do not re-propose.
 
-## Phase 1 — sure wins (~2 days, low risk)
+## Phase 1 — sure wins (~2 days, low risk) — **DONE 2026-07-31**
 
-| item | expected | effort |
+| item | expected | measured outcome |
 |---|---|---|
-| Pinned-memory H2D fix in trainer data path | −0.4% step @480p | 0.5 d |
-| 4-wide FADD tree for row_sum (mirrors the measured fmax win) | +0.3–1.0% fwd | 0.25 d |
-| batch=2 instead of 2× grad-accum (**recipe-permitting**) | −1–1.5% step/sample | 0.5–1 d |
-| cvt hygiene + cross zero_init tidy | ~0, bit-neutral | 0.5 d |
+| Pinned-memory H2D fix in trainer data path | −0.4% step @480p | **KEPT: −0.27%** synthetic, neutral real-data; batches bitwise-identical |
+| 4-wide FADD tree for row_sum (mirrors the measured fmax win) | +0.3–1.0% fwd | **REJECTED: 0.3–0.9% slower** all self shapes (ABBA A/B; row_sum is off the exp2 critical path — see FEATURES.md) |
+| batch=2 instead of 2× grad-accum (**recipe-permitting**) | −1–1.5% step/sample | **480p: −0.6…−1.0%/sample (+4.2 GiB); 720p: neutral (+13.3 GiB).** Report-only; defaults unchanged |
+| cvt hygiene + cross zero_init tidy | ~0, bit-neutral | **AUDIT CLEAN** — narrowing cvts already packed; fills ≈14 µs (0.6% of chain) |
 
 ## Phase 2 — the dQ campaign (~1–1.5 weeks, medium risk)
 
