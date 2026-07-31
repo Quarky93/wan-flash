@@ -37,6 +37,7 @@ in the git history of this file.
 | `num_stages` | **2** | KEEP 2. Re-tested under single+cluster (no sO, smem headroom exists): 3 stages = 671.2/687.0/680.2/678.2 vs 673.9/684.6/683.9/678.7 — noise-level mixed. | also pre-cluster: +0.3% @single |
 | `mma_pv_is_rs` | True | Only RS implemented (P never leaves registers; FA4 default at hd128). SS path not built — FA4's own data says RS wins at 128×128. | — |
 | fmax reduce | 4-wide tree | KEEP. `TensorSSA.reduce(MAX)` emits a serial FMAX chain; hand 4-wide tree (FA3/FA4 idiom) gives ILP 4. | self 75600: 658.7 → 667.9 (+1.4%); 32760 flat |
+| row_sum reduce | serial `reduce(ADD)` | **REJECTED 2026-07-31** (roadmap Phase 1a): 4-wide FADD tree for row_sum, mirroring the fmax win. Paired ABBA A/B (same process, both variants in the compile cache, 8 counted rounds, burn-in dropped): tree is 0.3–0.9% SLOWER at all four self shapes. Mechanism: row max gates the exp2 on the critical path, but row_sum is consumed only at the next block's accumulation — the serial chain already hides under WGMMA, and the tree pays an extra rmem materialization. Do not re-propose without new evidence. | serial/tree medians: h12-32760 0.9929, h12-75600 0.9933, h40-32760 0.9907, h40-75600 0.9971 |
 | mainloop `unroll` | 1 | KEEP 1. unroll=2 helped 32760 (+0.8%) but catastrophically regressed 75600 (661 → 440, reproducible; pathological codegen). Not robust. | — |
 
 ## Correctness gates (all green)
