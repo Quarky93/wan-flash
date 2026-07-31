@@ -33,18 +33,16 @@ key facts:
 
 ## Phase 2 — the dQ campaign (~1–1.5 weeks, medium risk)
 
-1. **Cluster-pair dQ reduction over DSM** (both investigation tracks' #1):
-   the existing cluster_n=2 pair covers the same m-rows; reduce the peer's
-   dQ chunk smem-to-smem (`cp.async.bulk.shared::cluster`) and issue ONE
-   gmem bulk-add per pair — halves the dominant L2-RMW stream.
-   Expected +2.5–5% bwd at h40, +1–2% at h12 (clock refund, interpolated
-   from the +127 MHz ablation). Bundle the sm100 finer dQ-flush granularity.
-   **Gates:** all-8-shape A/B, and a cluster-exit soak test (the CUDA-719
-   fault class scales with pair count — producer_tail rule applies to every
-   new peer interaction).
-2. **cluster_n=4 on top** (+1.5–2.5% bwd at h40/75600; 1–2 d) — second
-   halving of Q/dO traffic; diminishing but cheap once (1) hardens the
-   exit-safety machinery.
+1. **Cluster-pair dQ reduction over DSM** — **REJECTED 2026-07-31 after a
+   1-day spike** (full evidence in FEATURES.md; code on branch
+   `dq-dsm-experiment`). The premise silently assumed an fp32 DSM reduce;
+   sm90's is integer-only (ptxas-probed), smem has no room for copy
+   staging, and every feasible ld+add+st combine placement (store warp
+   0.22×, 24-reg crew 0.73–0.78×, MMA WGs 0.58–0.61×) costs more than the
+   measured +2.4–3.5% upper bound (handshake+half-flush with adds
+   skipped). An sm100 technique; do not re-attempt on sm90.
+2. **cluster_n=4** (+1.5–2.5% bwd at h40/75600; 1–2 d) — second halving of
+   Q/dO multicast traffic. Independent of (1); still live.
 
 ## Phase 3 — the bubble (timeboxed 2 weeks, exploratory, high risk)
 
