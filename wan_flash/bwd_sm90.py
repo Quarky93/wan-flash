@@ -254,7 +254,7 @@ class WanFlashBwdSm90:
         assert tile_m % 16 == 0, "dK/dV contraction (K = tile_m) tiles by k16"
         assert num_stages in (1, 2)
         assert nsplit >= 1
-        assert cluster_n in (1, 2)
+        assert cluster_n in (1, 2, 4)
         if cluster_n > 1:
             # cluster pairs adjacent n-blocks of a head: Q/dO/(stats) streams
             # are shared via TMA multicast. Not combined with split-M.

@@ -41,8 +41,16 @@ key facts:
    0.22×, 24-reg crew 0.73–0.78×, MMA WGs 0.58–0.61×) costs more than the
    measured +2.4–3.5% upper bound (handshake+half-flush with adds
    skipped). An sm100 technique; do not re-attempt on sm90.
-2. **cluster_n=4** (+1.5–2.5% bwd at h40/75600; 1–2 d) — second halving of
-   Q/dO multicast traffic. Independent of (1); still live.
+2. **cluster_n=4** — **REJECTED 2026-07-31**: implemented (one-line assert
+   widening — the machinery generalized), exact incl. multi-phantom tails,
+   but 4.7–6.4% SLOWER than cluster_n=2 at all self shapes (4-way lockstep
+   jitter coupling + quarter-tile multicast boxes). Expected +1.5–2.5%;
+   the second traffic halving does not pay on sm90.
+
+**Phase 2 closed 2026-07-31: both items refuted by measurement.** The bwd
+dQaccum L2-RMW pocket (+127 MHz if removed) is real but unreachable on
+sm90 — it needs sm100's fp32 DSM reduce or bigger smem. Remaining live
+items: Phase 2.5 (double-buffered sQ, fwd @32760 only) and Phase 3.
 
 ## Phase 3 — the bubble (timeboxed 2 weeks, exploratory, high risk)
 
