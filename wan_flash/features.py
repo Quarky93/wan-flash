@@ -68,6 +68,7 @@ class BwdFeatures:
     num_stages: int = 2
     nsplit: int = 0
     cluster_n: int = 2   # Q/dO TMA multicast pairs: beats FA4 at all self shapes
+    sgemm_rotate: bool = False  # Phase-3 software-pipelined loop, under A/B
 
 
 _current = FwdFeatures()

@@ -72,14 +72,20 @@ def _cvt_f32x2_bf16x2(a, b, *, loc=None, ip=None) -> cutlass.Int32:
 
 
 @cute.jit
+def _cvt_bf16_frag_into(src: cute.Tensor, dst: cute.Tensor):
+    """fp32 fragment -> bf16 fragment (in place) via packed converts."""
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = _cvt_f32x2_bf16x2(src[2 * i], src[2 * i + 1])
+
+
+@cute.jit
 def _cvt_bf16_frag(src: cute.Tensor) -> cute.Tensor:
     """fp32 fragment -> bf16 fragment via packed converts. TensorSSA .to()
     emits one scalar cvt per element at our (non-128x128) accumulator shapes;
     this is the FA3/FA4 packed idiom."""
     dst = cute.make_fragment_like(src, BFloat16)
-    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
-    for i in cutlass.range_constexpr(cute.size(dst_i32)):
-        dst_i32[i] = _cvt_f32x2_bf16x2(src[2 * i], src[2 * i + 1])
+    _cvt_bf16_frag_into(src, dst)
     return dst
 
 # named barriers (0 is reserved for sync_threads)
@@ -91,7 +97,6 @@ BAR_EPI = 6          # dK/dV staging through sK/sV
 
 def _round_up(x: int, m: int) -> int:
     return (x + m - 1) // m * m
-
 
 # =====================================================================
 # Phase A: preprocess  (D = rowsum(O*dO), lse -> lse*log2e, zero dQaccum)
@@ -247,7 +252,16 @@ class WanFlashBwdSm90:
         num_stages: int = 2,
         nsplit: int = 1,
         cluster_n: int = 1,
+        sgemm_rotate: bool = False,
     ):
+        # Software-pipelined consumer loop (roadmap Phase 3): the next
+        # block's S/dP GEMMs issue contiguously with the current block's
+        # dV/dQ/dK burst, so their execution fills the dS-critical-path
+        # bubble. Fine-grained reordering was measured-out (-15.5%: a wgmma
+        # issue mid-pointwise drags wgmma.fence); this keeps every GEMM
+        # issue inside one contiguous burst per block. nsplit==1 only
+        # (split ranges can be empty; the rotated prologue can't be).
+        self.sgemm_rotate = bool(sgemm_rotate) and nsplit == 1
         self.num_wg_mma = 2
         assert head_dim % 16 == 0 and head_dim <= 128
         assert tile_n == 64 * self.num_wg_mma, "SdP_swapAB M = tile_n = 64*num_wg"
@@ -842,18 +856,27 @@ class WanFlashBwdSm90:
 
         # S^T = K @ Q^T (swapped); Q via B_idx (staged)
         shape_S = (self.tile_m, self.tile_n, self.head_dim)
-        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+        acc_S_rot, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_SdP, shape_S, sQ, sK, swap_AB=True
         )
         mma_qk_fn = partial(
             gemm_zero_init, tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, swap_AB=True
         )
         # dP^T = V @ dO^T (swapped)
-        _, tdPrdO, tdPrV = sm90_utils.partition_fragment_ABC(
+        acc_dP_rot, tdPrdO, tdPrV = sm90_utils.partition_fragment_ABC(
             wg_mma_SdP, shape_S, sdO, sV, swap_AB=True
         )
         mma_dov_fn = partial(
             gemm_zero_init, tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, swap_AB=True
+        )
+        # rotated loop: same GEMMs but into PREALLOCATED accumulators so the
+        # next block's S/dP can issue while this block's epilogue runs
+        # (zero_init per block; register pressure unchanged — same fragments)
+        mma_qk_acc_fn = partial(
+            gemm_w_idx, tiled_mma_SdP, acc_S_rot, tSrQ, tSrK, swap_AB=True
+        )
+        mma_dov_acc_fn = partial(
+            gemm_w_idx, tiled_mma_SdP, acc_dP_rot, tdPrdO, tdPrV, swap_AB=True
         )
         # dV += P^T @ dO: A = P^T straight from registers, B = dO^T (MN-major)
         sdOt = layout_utils.transpose_view(sdO)
@@ -911,20 +934,29 @@ class WanFlashBwdSm90:
             acc_dV.fill(0.0)
             acc_dK.fill(0.0)
 
-        c_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.Q_stage
-        )
-        dKV_accumulate = Boolean(False)
-        for m_block in cutlass.range(m_lo, m_hi, unroll=1):
-            c_state = self._mma_m_block(
-                c_state, wg_idx,
-                mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
-                copy_dS_r2s, pipeline_q, pipeline_do,
-                tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
-                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
-                PdS_barrier, dKV_accumulate,
+        if const_expr(self.sgemm_rotate):
+            self._mma_rotated(
+                wg_idx, mma_qk_fn, mma_dov_fn,
+                mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s,
+                pipeline_q, pipeline_do, tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
+                thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, PdS_barrier,
+                m_lo, m_hi,
             )
-            dKV_accumulate = Boolean(True)
+        else:
+            c_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.Q_stage
+            )
+            dKV_accumulate = Boolean(False)
+            for m_block in cutlass.range(m_lo, m_hi, unroll=1):
+                c_state = self._mma_m_block(
+                    c_state, wg_idx,
+                    mma_qk_fn, mma_dov_fn, mma_pdo_fn, mma_dsq_fn, mma_dsk_fn,
+                    copy_dS_r2s, pipeline_q, pipeline_do,
+                    tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
+                    thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start,
+                    PdS_barrier, dKV_accumulate,
+                )
+                dKV_accumulate = Boolean(True)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         acc_dK.store(acc_dK.load() * self.softmax_scale)
@@ -1044,6 +1076,147 @@ class WanFlashBwdSm90:
         pipeline_q.consumer_release(c_state)
         c_state.advance()
         return c_state
+
+    @cute.jit
+    def _mask_softmax_P(self, acc_S, tLSErLSE, thr_mma_SdP, tiled_mma_SdP,
+                        seqlenk_col_start):
+        """K-tail mask + P = exp2(S*scale_log2 - lse), in place on acc_S."""
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+        if const_expr(self.seqlen_k_static % self.tile_n != 0):
+            cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+            tScS_mn = layout_utils.reshape_acc_to_mn(
+                thr_mma_SdP.partition_C(cS), transpose=True
+            )
+            t0ScS_mn = layout_utils.reshape_acc_to_mn(
+                tiled_mma_SdP.get_slice(0).partition_C(cS), transpose=True
+            )
+            limit = seqlenk_col_start - tScS_mn[0][0]
+            for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                oob = t0ScS_mn[0, c][0] >= limit
+                for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+                    acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+        for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
+            lse_val = tLSErLSE[r]
+            for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
+                acc_S_mn[r, c] = cute.math.exp2(
+                    acc_S_mn[r, c] * self.scale_log2 - lse_val, fastmath=True
+                )
+
+    @cute.jit
+    def _pointwise_dS(self, acc_S, acc_dP, tLSErdPsum):
+        """dS = P * (dP - D), in place on acc_dP (acc_S holds P)."""
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+        for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+            dpsum_val = tLSErdPsum[r]
+            for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
+
+    @cute.jit
+    def _mma_rotated(
+        self, wg_idx, mma_qk_fn, mma_dov_fn,
+        mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s,
+        pipeline_q, pipeline_do, tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
+        thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, PdS_barrier,
+        m_lo, m_hi,
+    ):
+        """Software-pipelined consumer loop (roadmap Phase 3). Block i's
+        S/dP GEMMs issue at the TOP of body i; the previous block's dK GEMM
+        (G5) is still in flight across the body boundary, so its execution
+        covers this block's pointwise sections — the tensor-idle pocket on
+        the dS critical path.
+
+        Hard-won structural rules (each violated form was measured):
+        - NO runtime branch around any GEMM issue (scf.if regions serialize
+          the async pipeline: 2.8x slower as a branch-in-body variant).
+        - ONE call site per (gemm, accumulator) pair in the whole function —
+          duplicated sites (prologue/peel) make the DSL's wgmma pipeliner
+          emit fence+DEPBAR around EVERY HGMMA (68 singly-fenced GEMMs).
+        - acc_dQ must die (epilogue) before more accumulators go live, or
+          ptxas spills (160 B stack, 60 LDL/STL).
+
+        Wait-group ladder at the top of body i (pending {G5(i-1), G1, G2}):
+          wait_group(2) -> G5(i-1) retired -> release Q(i-1)
+          wait_group(1) -> G1(i) retired -> mask + P(i) pointwise
+          wait_group(0) -> G2(i) retired -> dS(i) pointwise
+        """
+        c_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.Q_stage
+        )
+        c_prev = c_state.clone()
+        has_prev = Boolean(False)
+        dKV_accumulate = Boolean(False)
+        for i in cutlass.range(m_lo, m_hi, unroll=1):
+            smem_idx = c_state.index
+            smem_idx_PdS = smem_idx if const_expr(self.PdS_stage > 1) else 0
+
+            # ---- issue S/dP GEMMs for block i (G5(i-1) still in flight)
+            pipeline_q.consumer_wait(
+                c_state, pipeline_q.consumer_try_wait(c_state)
+            )
+            acc_S = mma_qk_fn(A_idx=smem_idx, wg_wait=-1)
+            tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx])
+            pipeline_do.consumer_wait(
+                c_state, pipeline_do.consumer_try_wait(c_state)
+            )
+            acc_dP = mma_dov_fn(A_idx=smem_idx, wg_wait=-1)
+
+            # ---- ladder + pointwise (G5(i-1)/G1/G2 execute under this)
+            warpgroup.wait_group(2)  # G5(i-1) retired: sQ(i-1)/frags free
+            if has_prev:
+                pipeline_q.consumer_release(c_prev)
+            warpgroup.wait_group(1)  # G1(i) retired
+            self._mask_softmax_P(acc_S, tLSErLSE, thr_mma_SdP,
+                                 tiled_mma_SdP, seqlenk_col_start)
+            tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx])
+            tdVrP = _cvt_bf16_frag(layout_utils.reshape_acc_to_frgA(acc_S))
+            warpgroup.wait_group(0)  # G2(i) retired
+            self._pointwise_dS(acc_S, acc_dP, tLSErdPsum)
+            tdKrdS = _cvt_bf16_frag(layout_utils.reshape_acc_to_frgA(acc_dP))
+
+            # ---- burst: dS to smem, then dV/dQ/dK back-to-back
+            if const_expr(self.PdS_stage == 1):
+                cute.arch.fence_view_async_shared()
+                PdS_barrier.arrive_and_wait()
+            copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
+            # [GEMM 3] dV += P^T @ dO
+            mma_pdo_fn(tCrA=tdVrP, B_idx=smem_idx, zero_init=~dKV_accumulate,
+                       wg_wait=-1)
+            cute.arch.fence_view_async_shared()
+            PdS_barrier.arrive_and_wait()
+            # [GEMM 4] dQ = dS @ K (waits GEMM 3)
+            acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)
+            pipeline_do.consumer_release(c_state)  # G2(i)+G3(i) both done
+            # [GEMM 5] dK += dS^T @ Q (waits GEMM 4; retires at body i+1)
+            mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx, zero_init=~dKV_accumulate,
+                       wg_wait=1)
+            dKV_accumulate = Boolean(True)
+
+            # ---- dQ epilogue (i): G4 done via GEMM 5's wg_wait; G5 spans
+            # into the next body, covering this epilogue and the next
+            # block's Q/dO waits + pointwise
+            cute.arch.barrier(
+                barrier_id=BAR_DQ_EMPTY0 + wg_idx,
+                number_of_threads=128 + cute.arch.WARP_SIZE,
+            )
+            tdQrdQaccum_flat = cute.make_tensor(
+                acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape)
+            )
+            cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier_arrive(
+                barrier_id=BAR_DQ_FULL0 + wg_idx,
+                number_of_threads=128 + cute.arch.WARP_SIZE,
+            )
+
+            warpgroup.wait_group(0)  # DIAG: retire G5 before the back-edge
+            c_prev = c_state.clone()
+            has_prev = Boolean(True)
+            c_state.advance()
+
+        warpgroup.wait_group(0)  # G5(last) done (sQ free)
+        pipeline_q.consumer_release(c_prev)
+
 
     @cute.jit
     def _epilogue_dKV(

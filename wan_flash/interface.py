@@ -167,7 +167,7 @@ def wan_flash_bwd(
         pre = WanFlashBwdPreprocessSm90(head_dim=d, tile_m=tile_m)
         main = WanFlashBwdSm90(
             head_dim=d, tile_m=tile_m, tile_n=f.tile_n, num_stages=f.num_stages,
-            nsplit=nsplit, cluster_n=cluster_n,
+            nsplit=nsplit, cluster_n=cluster_n, sgemm_rotate=f.sgemm_rotate,
         )
         post = WanFlashBwdPostprocessSm90(
             head_dim=d, tile_rows=tile_m, num_wg=main.num_wg_dQ,
