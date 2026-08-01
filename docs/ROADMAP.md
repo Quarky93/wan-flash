@@ -71,6 +71,24 @@ loop rotation (next block's S-GEMM issued inside the previous block's
 epilogue region, GEMM bursts kept contiguous) — the full Phase-3 build,
 with acc_S double-buffering as its register-budget crux.
 
+**Full build done 2026-08-01: NO-GO on sm90 + CuTeDSL** (branch
+`phase3-rotation-experiment`, correct at all shapes). The rotation was
+built and iterated through four measured failure modes — branch-in-body
+(0.35×), duplicated gemm call-sites with preallocated accumulators
+(fence+DEPBAR around EVERY HGMMA: 68 vs base's 5), register spills
+(STACK:160 → fixed), and finally the root blocker: **the CuTeDSL wgmma
+pipeliner falls back to per-instruction fencing for the whole function
+whenever a wgmma group is left pending across the scf.for back-edge**
+(diagnostic: adding one retire-wait before the back-edge takes fences
+34 → 5). A pending cross-iteration group IS the rotation's mechanism, so
+the technique is inexpressible without full serialization. With all
+groups retired per block, the best reachable reorder measures
+0.93–0.98× — base's structure is already optimal in that class. Paths
+that could reopen this: an upstream CuTeDSL change (allow pending wgmma
+groups across loop back-edges), or hand-written CUDA/PTX for the
+consumer loop. **The dS-bubble pocket survives as unmined on sm90 — now
+with the precise reason no one has mined it.**
+
 Optional Phase 2.5: double-buffered sQ — **REJECTED 2026-08-01: measured
 FLAT** (the shipped early-Q-release already covers the tile boundary;
 FEATURES.md has the numbers + a producer/consumer PipelineState deadlock
