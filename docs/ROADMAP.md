@@ -63,8 +63,18 @@ the K/V piggyback — prototype-first with a hard go/no-go gate at day 5.
 This is the largest remaining pocket on sm90, and it is unmined by FA3/FA4
 too — landing it would be a genuinely novel result.
 
-Optional Phase 2.5: double-buffered sQ for the S=32760 shapes (+1.5–2.5% fwd
-there, ~0 at 75600; 2–4 d; must re-verify the zero-quantization behavior).
+**Probe #1 done 2026-08-01 (dV-GEMM hoist): REJECTED, −15.5% uniformly** —
+a WGMMA issue mid-pointwise drags a `wgmma.fence` that serializes the ALU
+section around it (FEATURES.md). Constraint learned: the pocket cannot be
+mined by fine-grained GEMM reordering; the viable shape is a coarse-grain
+loop rotation (next block's S-GEMM issued inside the previous block's
+epilogue region, GEMM bursts kept contiguous) — the full Phase-3 build,
+with acc_S double-buffering as its register-budget crux.
+
+Optional Phase 2.5: double-buffered sQ — **REJECTED 2026-08-01: measured
+FLAT** (the shipped early-Q-release already covers the tile boundary;
+FEATURES.md has the numbers + a producer/consumer PipelineState deadlock
+lesson).
 
 Cross-bwd chain fusion (fold pre/post into main; −28–35% of the cross chain,
 1.65× → ~2.3× FA3 headline) — schedule when the headline ratio matters more
