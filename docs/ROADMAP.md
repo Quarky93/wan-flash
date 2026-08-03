@@ -89,6 +89,23 @@ groups across loop back-edges), or hand-written CUDA/PTX for the
 consumer loop. **The dS-bubble pocket survives as unmined on sm90 — now
 with the precise reason no one has mined it.**
 
+**Inline-PTX escape hatch tested 2026-08-03: DOES NOT WORK** (branch
+`phase3-ptx-wgmma`). Hypothesis: issue the boundary-crossing GEMM as
+inline PTX so the MLIR pass never sees the pending group. Measured: one
+PTX wgmma anywhere in the function makes the pass bail to
+per-instruction fencing globally — in the BASE loop shape (5 fences
+normally) it jumps to **34**, timing 0.80–0.85×. The pass treats an
+opaque asm block as unknown wgmma state and fences every DSL wgmma it
+owns, so PTX+DSL mixing is strictly worse than either alone. Supporting
+findings: `inline_ptx`'s `read_write_args` silently discards updated
+values (accumulators need an explicit 64-wide mov ladder per GEMM), and
+`MakeGMMASmemDescOp` exists in the dialect but has no smem_desc→i64
+cast, so every descriptor must be hand-encoded. The only surviving
+variant is an ALL-PTX consumer loop (all 5 GEMMs, ss-mode double
+descriptors, mov ladders throughout) — i.e. the CUDA rewrite scoped to
+one function, carrying a mov-ladder tax of the same order as the
++0.5–1% step prize. **Not recommended.**
+
 Optional Phase 2.5: double-buffered sQ — **REJECTED 2026-08-01: measured
 FLAT** (the shipped early-Q-release already covers the tile boundary;
 FEATURES.md has the numbers + a producer/consumer PipelineState deadlock
