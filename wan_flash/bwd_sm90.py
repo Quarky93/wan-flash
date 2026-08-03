@@ -88,6 +88,45 @@ def _cvt_bf16_frag(src: cute.Tensor) -> cute.Tensor:
     _cvt_bf16_frag_into(src, dst)
     return dst
 
+
+_G5_NK = 5  # k-steps: tile_m(80)/16
+
+
+@dsl_user_op
+def _ptx_wgmma_dk(acc_prev, a_regs, desc, *, loc=None, ip=None):
+    """PROBE: G5 (dK += dS^T@Q) as inline PTX wgmma, invisible to the MLIR
+    wgmma pass. Emits fence + NK issues + commit, NO wait — the pending
+    group crosses the loop back-edge on purpose (that is the whole point).
+    Accumulators come in as read-only and out as write-only with an
+    explicit mov ladder, because the DSL's read_write_args discards the
+    updated values (its inline_ptx returns only write_only results)."""
+    movs = "\n\t".join(
+        f"mov.f32 {{$w{i}}}, {{$r{i}}};" for i in range(64)
+    )
+    d = ", ".join(f"{{$w{i}}}" for i in range(64))
+    issues = []
+    for k in range(_G5_NK):
+        a = ", ".join(f"{{$r{64 + 4 * k + j}}}" for j in range(4))
+        issues.append(
+            "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+            f"{{{d}}}, {{{a}}}, {{$r{64 + 4 * _G5_NK}}}, 1, 1, 1, 0;"
+        )
+    ptx = (
+        movs + "\n\t"
+        + "wgmma.fence.sync.aligned;\n\t"
+        + "\n\t".join(issues) + "\n\t"
+        + "wgmma.commit_group.sync.aligned;"
+    )
+    return cute.arch.inline_ptx(
+        ptx,
+        write_only_types=[Float32] * 64,
+        read_only_args=([Float32(v) for v in acc_prev]
+                        + [Int32(v) for v in a_regs]
+                        + [cutlass.Int64(desc)]),
+        loc=loc, ip=ip,
+    )
+
+
 # named barriers (0 is reserved for sync_threads)
 BAR_PDS = 1          # sequences the sdS buffer between the two MMA WGs
 BAR_DQ_EMPTY0 = 2    # +wg_idx: store warp released sdQaccum chunk wg
@@ -262,6 +301,7 @@ class WanFlashBwdSm90:
         # issue inside one contiguous burst per block. nsplit==1 only
         # (split ranges can be empty; the rotated prologue can't be).
         self.sgemm_rotate = bool(sgemm_rotate) and nsplit == 1
+        self.ptx_g5 = __import__('os').environ.get('WAN_FLASH_PTX_G5', '0') == '1'
         self.num_wg_mma = 2
         assert head_dim % 16 == 0 and head_dim <= 128
         assert tile_n == 64 * self.num_wg_mma, "SdP_swapAB M = tile_n = 64*num_wg"
@@ -937,12 +977,14 @@ class WanFlashBwdSm90:
         if const_expr(self.sgemm_rotate):
             self._mma_rotated(
                 wg_idx, mma_qk_fn, mma_dov_fn,
-                mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s,
+                mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s, acc_dK, sQ,
                 pipeline_q, pipeline_do, tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
                 thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, PdS_barrier,
                 m_lo, m_hi,
             )
         else:
+            self._acc_dK_probe = acc_dK
+            self._sQ_probe = sQ
             c_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.Q_stage
             )
@@ -1055,7 +1097,23 @@ class WanFlashBwdSm90:
         acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)  # waits GEMM 3
         pipeline_do.consumer_release(c_state)
         # [GEMM 5] dK += dS^T @ Q
-        mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx, zero_init=~dKV_accumulate, wg_wait=1)  # waits GEMM 4
+        if const_expr(self.ptx_g5):
+            # PROBE (wrong results): PTX G5 inside the BASE loop shape
+            warpgroup.wait_group(1)
+            acc_dK_flat2 = cute.make_tensor(
+                self._acc_dK_probe.iterator,
+                cute.make_layout(cute.size(self._acc_dK_probe)),
+            )
+            dS_i32b = cute.recast_tensor(tdKrdS, Int32)
+            outs2 = _ptx_wgmma_dk(
+                tuple(acc_dK_flat2[i] for i in range(64)),
+                tuple(dS_i32b[i] for i in range(4 * _G5_NK)),
+                cutlass.Int64(self._sQ_probe.iterator.toint()),
+            )
+            for i in cutlass.range_constexpr(64):
+                acc_dK_flat2[i] = outs2[i]
+        else:
+            mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx, zero_init=~dKV_accumulate, wg_wait=1)  # waits GEMM 4
 
         # acc_dQ -> sdQaccum chunk (ping-pong with the store warp)
         cute.arch.barrier(
@@ -1115,7 +1173,7 @@ class WanFlashBwdSm90:
     @cute.jit
     def _mma_rotated(
         self, wg_idx, mma_qk_fn, mma_dov_fn,
-        mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s,
+        mma_pdo_fn, mma_dsq_fn, mma_dsk_fn, copy_dS_r2s, acc_dK, sQ,
         pipeline_q, pipeline_do, tLSEsLSE, tLSEsdPsum, tdQsdQaccum,
         thr_mma_SdP, tiled_mma_SdP, seqlenk_col_start, PdS_barrier,
         m_lo, m_hi,
@@ -1140,6 +1198,9 @@ class WanFlashBwdSm90:
           wait_group(1) -> G1(i) retired -> mask + P(i) pointwise
           wait_group(0) -> G2(i) retired -> dS(i) pointwise
         """
+        acc_dK_flat = cute.make_tensor(
+            acc_dK.iterator, cute.make_layout(cute.size(acc_dK))
+        )
         c_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.Q_stage
         )
@@ -1188,8 +1249,21 @@ class WanFlashBwdSm90:
             acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)
             pipeline_do.consumer_release(c_state)  # G2(i)+G3(i) both done
             # [GEMM 5] dK += dS^T @ Q (waits GEMM 4; retires at body i+1)
-            mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx, zero_init=~dKV_accumulate,
-                       wg_wait=1)
+            if const_expr(self.ptx_g5):
+                # PROBE: descriptor is deliberately unencoded (results WRONG);
+                # this build exists only to read the SASS fence count.
+                warpgroup.wait_group(1)  # keep G4's ordering guarantee
+                dS_i32 = cute.recast_tensor(tdKrdS, Int32)
+                outs = _ptx_wgmma_dk(
+                    tuple(acc_dK_flat[i] for i in range(64)),
+                    tuple(dS_i32[i] for i in range(4 * _G5_NK)),
+                    cutlass.Int64(sQ.iterator.toint()),
+                )
+                for i in cutlass.range_constexpr(64):
+                    acc_dK_flat[i] = outs[i]
+            else:
+                mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx, zero_init=~dKV_accumulate,
+                           wg_wait=1)
             dKV_accumulate = Boolean(True)
 
             # ---- dQ epilogue (i): G4 done via GEMM 5's wg_wait; G5 spans
