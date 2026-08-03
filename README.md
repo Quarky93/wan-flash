@@ -36,9 +36,18 @@ wan_flash/
   interface.py      torch autograd op: wan_flash_attn(q, k, v) -> (o, lse)
   shapes.py         the Wan shape registry + tile arithmetic
 tests/              chunked-fp32 oracle + correctness batteries (pytest)
-bench/              baseline comparison + feature-matrix runner + perf gate
-docs/DESIGN.md      kernel architecture (from FA3/FA4 source study)
-docs/FEATURES.md    per-feature A/B verdicts with measurements
+bench/              baseline comparison (fa3 / fa4 / wan) across Wan shapes
+tools/ab_feature.py paired-ABBA A/B harness — the protocol behind every
+                    verdict in docs/FEATURES.md (run it before changing a
+                    default; single unpaired deltas are noise at these margins)
+tools/dev*.py       inner-loop dev harnesses (kernel vs oracle, small shapes)
+docs/FEATURES.md    per-feature A/B verdicts with measurements, incl. the
+                    rejected ideas and why (read before re-proposing one)
+docs/ROADMAP.md     remaining headroom: what is locked, by what, and what
+                    would unlock it
+docs/{FWD,BWD}_STUDY.md, SPECIALIZATION.md, CUTEDSL_COOKBOOK.md
+                    architecture notes from the FA3/FA4 source study + the
+                    DSL footguns this kernel hit (read before writing CuTeDSL)
 ```
 
 ## Status
@@ -86,6 +95,18 @@ H100 SXM, raw backward (identical o/lse/do fed to all three):
 | cross h40 S=75600×512 | 380.3 TFLOP/s | **1.257x** | **1.245x** |
 
 Full 8-shape tables (fwd + bwd) and per-feature verdicts: `docs/FEATURES.md`.
+
+## Optimization status
+
+These defaults are a measured local optimum on sm90, not a starting point:
+the forward runs at 86–90% tensor-core-busy against the 698 W power cap with
+per-clock parity to FA3's C++ kernel, and the backward is the fastest of the
+three implementations while all three sit in the same 76–81% utilization band.
+`docs/ROADMAP.md` records the remaining headroom, what blocks each piece
+(compiler pass, missing sm90 primitive, power wall) and what would unlock it.
+Ideas that were built and measured but lost are kept on branches
+(`dq-dsm-experiment`, `phase3-rotation-experiment`, `phase3-ptx-wgmma`) with
+their verdicts in `docs/FEATURES.md` — check there before re-proposing one.
 
 ## License / provenance
 
